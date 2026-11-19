@@ -791,6 +791,11 @@ bool CreateTableConvertor::check()
                                                m_table, m_create_info);
   if (lakehouse_cfg.format != myduck::lakehouse::LakehouseFormat::kNone)
   {
+    if (m_thd && m_thd->lex && m_thd->lex->sql_command == SQLCOM_ALTER_TABLE)
+    {
+      my_error(ER_OPEN_AS_READONLY, MYF(0), "DuckDB");
+      return true;
+    }
     if (lakehouse_cfg.format == myduck::lakehouse::LakehouseFormat::kInvalid)
     {
       my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_CREATE_ERROR,

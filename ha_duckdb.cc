@@ -69,6 +69,7 @@ static my_bool copy_ddl_in_batch= TRUE;
 static my_bool dml_in_batch= TRUE;
 static my_bool update_modified_column_only= TRUE;
 static ulonglong autoinc_cache_size= 1000;
+char *lakehouse_allowed_paths= nullptr;
 
 static handler *duckdb_create_handler(handlerton *hton, TABLE_SHARE *table,
                                       MEM_ROOT *mem_root);
@@ -274,6 +275,7 @@ static void duckdb_drop_database(handlerton *hton, char *path)
     DBUG_VOID_RETURN;
   auto *ctx= get_duckdb_context(thd);
   auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
+  myduck::lakehouse::LakehouseCatalog::Instance().UnregisterSchema(db.name);
   DBUG_VOID_RETURN;
 }
 
@@ -299,6 +301,9 @@ static int duckdb_init_func(void *p)
 
   duckdb_hton->create_select= create_duckdb_select_handler;
   duckdb_hton->create_unit= create_duckdb_unit_handler;
+
+  myduck::lakehouse::SetAllowedPathPrefix(
+      lakehouse_allowed_paths ? lakehouse_allowed_paths : "");
 
   if (myduck::DuckdbManager::CreateInstance())
   {
@@ -378,13 +383,6 @@ bool ha_duckdb::is_lakehouse_table() const
   if (s->table_name.str && s->table_name.length > 0)
     table_name.assign(s->table_name.str, s->table_name.length);
 
-  if (!schema_name.empty() && !table_name.empty() &&
-      myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(
-          schema_name, table_name))
-  {
-    return true;
-  }
-
   std::string_view connect_sv;
   std::string_view comment_sv;
   if (s->connect_string.str && s->connect_string.length > 0)
@@ -395,14 +393,22 @@ bool ha_duckdb::is_lakehouse_table() const
 
   auto cfg= myduck::lakehouse::ParseLakehouseUri(schema_name, table_name,
                                                  connect_sv, comment_sv);
-  if (cfg.format != myduck::lakehouse::LakehouseFormat::kNone &&
-      cfg.format != myduck::lakehouse::LakehouseFormat::kInvalid)
+  if (cfg.format == myduck::lakehouse::LakehouseFormat::kNone)
+  {
+    if (!schema_name.empty() && !table_name.empty())
+      myduck::lakehouse::LakehouseCatalog::Instance().UnregisterTable(
+          schema_name, table_name);
+    return false;
+  }
+  if (cfg.format != myduck::lakehouse::LakehouseFormat::kInvalid)
   {
     if (!schema_name.empty() && !table_name.empty())
       myduck::lakehouse::LakehouseCatalog::Instance().RegisterTable(cfg);
     return true;
   }
-  return false;
+  return !schema_name.empty() && !table_name.empty() &&
+         myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(
+             schema_name, table_name);
 }
 
 int ha_duckdb::open(const char *, int, uint)
@@ -1402,7 +1408,11 @@ int ha_duckdb::create(const char *name, TABLE *form,
 
   if (query_result->HasError())
   {
-    push_duckdb_query_error(query_result->GetError());
+    if (lakehouse_cfg.format != myduck::lakehouse::LakehouseFormat::kNone)
+      my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_CREATE_ERROR,
+               query_result->GetError().c_str(), "DuckDB");
+    else
+      push_duckdb_query_error(query_result->GetError());
     DBUG_RETURN(HA_DUCKDB_CREATE_ERROR);
   }
 
@@ -1428,9 +1438,13 @@ int ha_duckdb::delete_table(const char *name)
   DatabaseTableNames dt(name);
   auto *ctx= get_duckdb_context(thd);
 
-  if (myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(
+  bool is_lakehouse=
+      is_lakehouse_table() ||
+      myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(
           dt.db_name, dt.table_name) ||
-      is_lakehouse_table())
+      myduck::lakehouse::IsDuckDBView(ctx->get_connection(), dt.db_name,
+                                      dt.table_name);
+  if (is_lakehouse)
   {
     std::string view_query= "DROP VIEW IF EXISTS " +
                             quote_duckdb_identifier(dt.db_name) + "." +
@@ -1450,18 +1464,7 @@ int ha_duckdb::delete_table(const char *name)
   auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
 
   if (query_result == nullptr || query_result->HasError())
-  {
-    /* Fallback in case a lakehouse view persisted across restart before open() */
-    std::string view_query= "DROP VIEW IF EXISTS " +
-                            quote_duckdb_identifier(dt.db_name) + "." +
-                            quote_duckdb_identifier(dt.table_name);
-    auto view_result= myduck::duckdb_query(ctx->get_connection(), view_query);
-    if (view_result == nullptr || view_result->HasError())
-      DBUG_RETURN(HA_DUCKDB_DROP_TABLE_ERROR);
-    myduck::lakehouse::LakehouseCatalog::Instance().UnregisterTable(
-        dt.db_name, dt.table_name);
-    DBUG_RETURN(0);
-  }
+    DBUG_RETURN(HA_DUCKDB_DROP_TABLE_ERROR);
 
   /*
     Drop the AUTO_INCREMENT sequence, if any. It must go after the table:
@@ -1505,9 +1508,11 @@ int ha_duckdb::rename_table(const char *from, const char *to)
   if (ret)
     DBUG_RETURN(ret);
 
-  if (myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(
+  if (is_lakehouse_table() ||
+      myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(
           old_t.db_name, old_t.table_name) ||
-      is_lakehouse_table())
+      myduck::lakehouse::IsDuckDBView(ctx->get_connection(), old_t.db_name,
+                                      old_t.table_name))
   {
     std::string view_rename=
         "USE " + quote_duckdb_identifier(old_t.db_name) +
@@ -1576,6 +1581,12 @@ ha_duckdb::check_if_supported_inplace_alter(TABLE *altered_table,
 {
   DBUG_ENTER("ha_duckdb::check_if_supported_inplace_alter");
 
+  if (is_lakehouse_table())
+  {
+    my_error(ER_OPEN_AS_READONLY, MYF(0), "DuckDB");
+    DBUG_RETURN(HA_ALTER_ERROR);
+  }
+
   if (database_changed(table->s->db.str, altered_table->s->db.str))
     DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
 
@@ -1600,6 +1611,12 @@ bool ha_duckdb::commit_inplace_alter_table(TABLE *altered_table,
                                            bool commit)
 {
   DBUG_ENTER("ha_duckdb::commit_inplace_alter_table");
+
+  if (is_lakehouse_table())
+  {
+    my_error(ER_OPEN_AS_READONLY, MYF(0), "DuckDB");
+    DBUG_RETURN(true);
+  }
 
   if (!commit)
     DBUG_RETURN(false);
@@ -1742,6 +1759,21 @@ static MYSQL_SYSVAR_STR(remote_url_prefixes, duckdb_remote_url_prefixes,
                         "URL prefixes the duckdb_load_* functions may read "
                         "from. Empty (the default) disables remote reads",
                         NULL, NULL, "");
+
+static void update_lakehouse_allowed_paths(THD *, struct st_mysql_sys_var *,
+                                           void *var, const void *save)
+{
+  const char *new_val= *static_cast<const char *const *>(save);
+  *static_cast<const char **>(var)= new_val;
+  myduck::lakehouse::SetAllowedPathPrefix(new_val ? new_val : "");
+}
+
+static MYSQL_SYSVAR_STR(lakehouse_allowed_paths, lakehouse_allowed_paths,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+                        "Allowed local directory prefix for external "
+                        "lakehouse (Iceberg/Paimon) table paths. Empty "
+                        "(the default) allows any absolute path",
+                        NULL, update_lakehouse_allowed_paths, "");
 
 /* ---- Quack (MDEV-41383, see Quack.MD) ---- */
 
@@ -1987,6 +2019,7 @@ my_bool get_thd_cross_engine_ryow(THD *thd)
 static struct st_mysql_sys_var *duckdb_system_variables[]= {
     MYSQL_SYSVAR(allow_run_in_duckdb),
     MYSQL_SYSVAR(allow_file_io), MYSQL_SYSVAR(remote_url_prefixes),
+    MYSQL_SYSVAR(lakehouse_allowed_paths),
     MYSQL_SYSVAR(quack_enabled), MYSQL_SYSVAR(quack_bind_address),
     MYSQL_SYSVAR(quack_port), MYSQL_SYSVAR(quack_ssl_cert),
     MYSQL_SYSVAR(quack_ssl_key), MYSQL_SYSVAR(quack_max_connections),

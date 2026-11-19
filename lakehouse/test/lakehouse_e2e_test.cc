@@ -13,6 +13,8 @@ extern "C" int32_t duckdb_register_static_extensions(void);
 namespace myduck::lakehouse {
 namespace {
 
+namespace duckdb_httplib = CPPHTTPLIB_NAMESPACE;
+
 class LakehouseE2ETest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -170,6 +172,55 @@ TEST_F(LakehouseE2ETest, ExecutesIcebergRestEndToEndCreateQueryAndDrop) {
 
   ASSERT_TRUE(ExecuteLakehouseDropTable(*conn_, "lake", "rest_orders", &err)) << err;
   EXPECT_FALSE(LakehouseCatalog::Instance().IsLakehouseTable("lake", "rest_orders"));
+}
+
+TEST_F(LakehouseE2ETest, PostRestartDropAndRenameInsideTransactionWithoutCatalogCache) {
+  std::string ice_path = std::string(LAKEHOUSE_FIXTURE_DIR) + "/iceberg_v2_orders";
+  auto ice_cfg = ParseLakehouseUri("lake", "orders", "iceberg://" + ice_path);
+  std::vector<LakehouseColumnDecl> ice_cols = {
+      {"order_id", "BIGINT"},
+      {"f1", "INTEGER"},
+      {"region", "VARCHAR"},
+      {"amount", "DOUBLE"},
+  };
+  std::string err;
+  ASSERT_TRUE(ExecuteLakehouseCreateTable(*conn_, ice_cfg, ice_cols, &err)) << err;
+  EXPECT_TRUE(LakehouseCatalog::Instance().IsLakehouseTable("lake", "orders"));
+
+  // Simulate mariadbd restart: clear the in-memory LakehouseCatalog while the DuckDB VIEW
+  // remains persisted in the DuckDB catalog.
+  LakehouseCatalog::Instance().ClearForTesting();
+  EXPECT_FALSE(LakehouseCatalog::Instance().IsLakehouseTable("lake", "orders"));
+
+  // Begin an explicit DuckDB transaction. Any failed catalog DDL (such as running
+  // DROP TABLE IF EXISTS on a VIEW) would invalidate this transaction.
+  ASSERT_FALSE(conn_->Query("BEGIN TRANSACTION")->HasError());
+
+  EXPECT_TRUE(IsDuckDBView(*conn_, "lake", "orders"));
+  EXPECT_FALSE(IsDuckDBView(*conn_, "lake", "nonexistent_view"));
+
+  // Post-restart RENAME via IsDuckDBView detection inside the active transaction
+  ASSERT_FALSE(
+      conn_->Query("USE \"lake\"; ALTER VIEW \"orders\" RENAME TO \"orders_v2\";")
+          ->HasError());
+  EXPECT_FALSE(IsDuckDBView(*conn_, "lake", "orders"));
+  EXPECT_TRUE(IsDuckDBView(*conn_, "lake", "orders_v2"));
+
+  // Post-restart DROP via ExecuteLakehouseDropTable (uses IsDuckDBView when catalog cache is cold)
+  ASSERT_TRUE(ExecuteLakehouseDropTable(*conn_, "lake", "orders_v2", &err)) << err;
+  EXPECT_FALSE(IsDuckDBView(*conn_, "lake", "orders_v2"));
+
+  // Prove the active DuckDB transaction is still valid and commits cleanly!
+  auto in_tx_res = conn_->Query("SELECT 42");
+  ASSERT_FALSE(in_tx_res->HasError()) << in_tx_res->GetError();
+  EXPECT_EQ(in_tx_res->Fetch()->GetValue(0, 0).GetValue<int32_t>(), 42);
+
+  auto commit_res = conn_->Query("COMMIT");
+  ASSERT_FALSE(commit_res->HasError()) << commit_res->GetError();
+
+  auto post_tx_res = conn_->Query("SELECT 100");
+  ASSERT_FALSE(post_tx_res->HasError()) << post_tx_res->GetError();
+  EXPECT_EQ(post_tx_res->Fetch()->GetValue(0, 0).GetValue<int32_t>(), 100);
 }
 
 }  // namespace

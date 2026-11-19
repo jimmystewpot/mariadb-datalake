@@ -1,6 +1,10 @@
 #include "lakehouse/paimon_arrow_stream.h"
 
+#include <unistd.h>
+
+#include <atomic>
 #include <cerrno>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -69,8 +73,42 @@ int StreamGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
     state->last_error = arrow_res.status().ToString();
     return EIO;
   }
-  *out = *arrow_res.value();
-  arrow_res.value()->release = nullptr;
+  ArrowSchema *c_schema = arrow_res.value().get();
+  if (!state->projected_field_names.empty() && c_schema->children != nullptr &&
+      c_schema->n_children > 0) {
+    const int64_t total_children = c_schema->n_children;
+    std::vector<bool> kept(static_cast<size_t>(total_children), false);
+    std::vector<ArrowSchema *> projected_children;
+    projected_children.reserve(state->projected_field_names.size());
+
+    for (const auto &proj_name : state->projected_field_names) {
+      for (int64_t i = 0; i < total_children; ++i) {
+        ArrowSchema *child = c_schema->children[i];
+        if (!kept[static_cast<size_t>(i)] && child != nullptr &&
+            child->name != nullptr && proj_name == child->name) {
+          kept[static_cast<size_t>(i)] = true;
+          projected_children.push_back(child);
+          break;
+        }
+      }
+    }
+
+    for (int64_t i = 0; i < total_children; ++i) {
+      if (!kept[static_cast<size_t>(i)]) {
+        ArrowSchema *child = c_schema->children[i];
+        if (child != nullptr && child->release != nullptr) {
+          child->release(child);
+        }
+      }
+    }
+
+    for (size_t i = 0; i < projected_children.size(); ++i) {
+      c_schema->children[i] = projected_children[i];
+    }
+    c_schema->n_children = static_cast<int64_t>(projected_children.size());
+  }
+  *out = *c_schema;
+  c_schema->release = nullptr;
   return 0;
 }
 
@@ -193,25 +231,41 @@ paimon::Result<std::shared_ptr<paimon::Schema>> LoadPaimonSchemaFromPath(
   if (!std::filesystem::exists(table_path, ec)) {
     return paimon::Status::IOError("Paimon table path does not exist: " + table_path);
   }
-  auto temp_wh = std::filesystem::temp_directory_path(ec) /
-                 ("paimon_standalone_cat_" + comp.table_name);
-  std::filesystem::remove_all(temp_wh, ec);
-  std::filesystem::create_directories(temp_wh / "default.db", ec);
-  std::filesystem::create_directory_symlink(table_path, temp_wh / "default.db" / comp.table_name,
-                                            ec);
+  static std::atomic<uint64_t> temp_counter{0};
+  const uint64_t seq = temp_counter.fetch_add(1, std::memory_order_relaxed);
+  auto temp_cat_dir =
+      std::filesystem::temp_directory_path(ec) /
+      ("paimon_standalone_cat_" +
+       std::to_string(static_cast<long long>(::getpid())) + "_" +
+       std::to_string(seq) + "_" + comp.table_name);
+
+  struct TempCatDirGuard {
+    std::filesystem::path dir;
+    ~TempCatDirGuard() {
+      std::error_code rm_ec;
+      std::filesystem::remove_all(dir, rm_ec);
+    }
+  } temp_guard{temp_cat_dir};
+
+  std::filesystem::remove_all(temp_cat_dir, ec);
+  std::filesystem::create_directories(temp_cat_dir / "default.db", ec);
   if (ec) {
-    std::filesystem::remove_all(temp_wh, ec);
-    return paimon::Status::IOError("Failed to link standalone Paimon table path: " + table_path);
+    return paimon::Status::IOError(
+        "Failed to create temporary Paimon catalog directory: " +
+        temp_cat_dir.string());
   }
-  auto cat_res = paimon::Catalog::Create(temp_wh.string(), {});
+  std::filesystem::create_directory_symlink(
+      table_path, temp_cat_dir / "default.db" / comp.table_name, ec);
+  if (ec) {
+    return paimon::Status::IOError(
+        "Failed to link standalone Paimon table path: " + table_path);
+  }
+  auto cat_res = paimon::Catalog::Create(temp_cat_dir.string(), {});
   if (!cat_res.ok()) {
-    std::filesystem::remove_all(temp_wh, ec);
     return cat_res.status();
   }
-  auto schema_res =
-      cat_res.value()->LoadTableSchema(paimon::Identifier("default", comp.table_name));
-  std::filesystem::remove_all(temp_wh, ec);
-  return schema_res;
+  return cat_res.value()->LoadTableSchema(
+      paimon::Identifier("default", comp.table_name));
 }
 
 std::unique_ptr<duckdb::ArrowArrayStreamWrapper> CreatePaimonArrowStream(

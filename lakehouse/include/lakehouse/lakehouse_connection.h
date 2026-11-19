@@ -40,6 +40,9 @@ struct LakehouseTableConfig {
 
 void SetAllowedPathPrefix(std::string prefix);
 
+bool ValidateLakehousePath(std::string_view table_path, bool allow_remote,
+                           std::string *error_out = nullptr);
+
 LakehouseTableConfig ParseLakehouseUri(std::string_view schema_name,
                                        std::string_view table_name,
                                        std::string_view connect_str,

@@ -18,7 +18,15 @@ TARGET_INCLUDE_DIRECTORIES(duckdb_lakehouse SYSTEM PUBLIC
   ${DUCKDB_SUBMODULE_DIR}/third_party/fmt/include
   ${OPENSSL_INCLUDE_DIR}
 )
-TARGET_LINK_LIBRARIES(duckdb_lakehouse PUBLIC ${DUCKDB_LIBRARY} libpaimon)
+TARGET_COMPILE_DEFINITIONS(duckdb_lakehouse PUBLIC
+  CPPHTTPLIB_OPENSSL_SUPPORT
+)
+TARGET_LINK_LIBRARIES(duckdb_lakehouse PUBLIC
+  ${DUCKDB_LIBRARY}
+  libpaimon
+  OpenSSL::SSL
+  OpenSSL::Crypto
+)
 
 IF(DUCKDB_UNIT_TESTS)
   FIND_PACKAGE(GTest QUIET)
@@ -62,6 +70,7 @@ IF(DUCKDB_UNIT_TESTS)
     TARGET_COMPILE_DEFINITIONS(${_target_name} PRIVATE
       PAIMON_GOLDEN_DATA_DIR="${PAIMON_SUBMODULE_DIR}/test/test_data"
       LAKEHOUSE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures"
+      QUACK_TEST_CERT_DIR="${PROJECT_SOURCE_DIR}/third_parties/duckdb-quack/test/certs"
     )
     TARGET_LINK_LIBRARIES(${_target_name} PRIVATE
       duckdb_lakehouse

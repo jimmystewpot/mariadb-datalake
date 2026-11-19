@@ -239,6 +239,11 @@ bool prepare_table(THD *thd, privilege_t want, bool write,
   bool exists= myduck::table_exists(thd, &db_l, &tbl_l, &hton);
   if (!exists || hton != duckdb_hton)
     return fail("not an existing ENGINE=DuckDB table");
+  if (myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(db, tbl))
+  {
+    my_error(ER_OPEN_AS_READONLY, MYF(0), "DuckDB");
+    return true;
+  }
   return false;
 }
 

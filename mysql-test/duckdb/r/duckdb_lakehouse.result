@@ -11,7 +11,7 @@ CONNECTION='iceberg:///tmp/wh/../etc/passwd';
 ERROR HY000: Got error 140 'Path traversal ('..') is not allowed in lakehouse CONNECTION URI' from DuckDB
 CREATE TABLE bad_missing (id INT) ENGINE=DuckDB
 CONNECTION='paimon:///nonexistent/wh/db.db/tbl';
-ERROR HY000: Got error 168 'Invalid Input Error: paimon_scan: failed to load table schema from '/nonexistent/wh/db.db/tbl'' from DuckDB
+ERROR HY000: Got error 140 'IO Error: paimon_scan: failed to load Paimon schema' from DuckDB
 #
 # 2) Apache Iceberg v2 external table via CONNECTION='iceberg://...' (no PK required)
 #

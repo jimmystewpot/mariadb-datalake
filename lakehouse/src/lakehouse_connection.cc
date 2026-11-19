@@ -84,6 +84,20 @@ bool ContainsPathTraversalSegment(std::string_view path) {
   return false;
 }
 
+bool HasUriAuthorityCredentials(std::string_view uri) {
+  size_t scheme_pos = uri.find("://");
+  if (scheme_pos == std::string_view::npos) {
+    return false;
+  }
+  size_t auth_start = scheme_pos + 3;
+  size_t auth_end = uri.find_first_of("/?#", auth_start);
+  std::string_view authority =
+      (auth_end == std::string_view::npos)
+          ? uri.substr(auth_start)
+          : uri.substr(auth_start, auth_end - auth_start);
+  return authority.find('@') != std::string_view::npos;
+}
+
 bool IsForbiddenCredentialParam(std::string_view key) {
   std::string lower = ToLowerAscii(key);
   return lower == "password" || lower == "secret" || lower == "token" ||
@@ -120,23 +134,39 @@ bool IsWithinAllowedPrefix(std::string_view table_path,
          table_path[prefix.size()] == '/';
 }
 
-bool ValidateTablePath(std::string_view raw_path, std::string *normalized_out,
-                       std::string *error_out) {
+bool ValidateTablePath(std::string_view raw_path, bool allow_remote,
+                       std::string *normalized_out, std::string *error_out) {
+  auto set_err = [&](std::string msg) {
+    if (error_out != nullptr) {
+      *error_out = std::move(msg);
+    }
+    return false;
+  };
+
   std::string_view path = TrimWhitespace(raw_path);
   if (path.empty()) {
-    *error_out = "Lakehouse table path cannot be empty";
-    return false;
+    return set_err("Lakehouse table path cannot be empty");
+  }
+  if (HasUriAuthorityCredentials(path)) {
+    return set_err(
+        "Plaintext userinfo credentials ('user:pass@') are forbidden in "
+        "lakehouse CONNECTION/COMMENT URI; configure DuckDB secrets or "
+        "environment variables instead");
   }
   if (ContainsPathTraversalSegment(path)) {
-    *error_out =
-        "Path traversal ('..') is not allowed in lakehouse CONNECTION URI";
-    return false;
+    return set_err(
+        "Path traversal ('..') is not allowed in lakehouse CONNECTION URI");
   }
   const bool is_remote = IsRemoteObjectStoreUri(path);
-  if (!is_remote && path.front() != '/') {
-    *error_out =
-        "Local lakehouse table path must be an absolute path starting with '/'";
-    return false;
+  if (is_remote && !allow_remote) {
+    return set_err(
+        "paimon:// currently requires an absolute local filesystem path (S3 "
+        "filesystem plugin is disabled)");
+  }
+  if (!is_remote &&
+      (path.find("://") != std::string_view::npos || path.front() != '/')) {
+    return set_err(
+        "Local lakehouse table path must be an absolute path starting with '/'");
   }
 
   std::string clean_path(path);
@@ -148,13 +178,14 @@ bool ValidateTablePath(std::string_view raw_path, std::string *normalized_out,
   std::string allowed_prefix = GetAllowedPathPrefix();
   if (!allowed_prefix.empty() &&
       !IsWithinAllowedPrefix(clean_path, allowed_prefix)) {
-    *error_out = "Lakehouse path '" + clean_path +
-                 "' is outside the allowed path prefix '" + allowed_prefix +
-                 "'";
-    return false;
+    return set_err("Lakehouse path '" + clean_path +
+                   "' is outside the allowed path prefix '" + allowed_prefix +
+                   "'");
   }
 
-  *normalized_out = std::move(clean_path);
+  if (normalized_out != nullptr) {
+    *normalized_out = std::move(clean_path);
+  }
   return true;
 }
 
@@ -199,6 +230,11 @@ std::string StripCollateClause(std::string_view duckdb_type) {
 void SetAllowedPathPrefix(std::string prefix) {
   std::lock_guard<std::mutex> lock(g_allowed_prefix_mutex);
   g_allowed_path_prefix = std::string(TrimWhitespace(prefix));
+}
+
+bool ValidateLakehousePath(std::string_view table_path, bool allow_remote,
+                           std::string *error_out) {
+  return ValidateTablePath(table_path, allow_remote, nullptr, error_out);
 }
 
 LakehouseTableConfig ParseLakehouseUri(std::string_view schema_name,
@@ -314,6 +350,21 @@ LakehouseTableConfig ParseLakehouseUri(std::string_view schema_name,
           cfg.error_message = "Empty endpoint parameter in iceberg_rest:// URI";
           return cfg;
         }
+        if (HasUriAuthorityCredentials(val) ||
+            val.find('@') != std::string_view::npos) {
+          cfg.format = LakehouseFormat::kInvalid;
+          cfg.error_message =
+              "Plaintext userinfo credentials ('user:pass@') are forbidden in "
+              "iceberg_rest:// endpoint; configure DuckDB secrets or "
+              "environment variables instead";
+          return cfg;
+        }
+        if (ContainsPathTraversalSegment(val)) {
+          cfg.format = LakehouseFormat::kInvalid;
+          cfg.error_message =
+              "Path traversal ('..') is not allowed in iceberg_rest:// endpoint";
+          return cfg;
+        }
         cfg.rest_endpoint = std::string(val);
       } else if (lower_key == "warehouse" &&
                  cfg.format == LakehouseFormat::kIcebergRest) {
@@ -341,7 +392,9 @@ LakehouseTableConfig ParseLakehouseUri(std::string_view schema_name,
   // 2. Validate body according to format
   if (cfg.format == LakehouseFormat::kPaimonPath ||
       cfg.format == LakehouseFormat::kIcebergPath) {
-    if (!ValidateTablePath(body, &cfg.table_path, &cfg.error_message)) {
+    const bool allow_remote = (cfg.format == LakehouseFormat::kIcebergPath);
+    if (!ValidateTablePath(body, allow_remote, &cfg.table_path,
+                           &cfg.error_message)) {
       cfg.format = LakehouseFormat::kInvalid;
       return cfg;
     }
@@ -361,14 +414,24 @@ LakehouseTableConfig ParseLakehouseUri(std::string_view schema_name,
           "iceberg_rest://<catalog>/<namespace>.<table>)";
       return cfg;
     }
-    cfg.rest_catalog = std::string(body.substr(0, slash_pos));
+    std::string_view catalog_part = body.substr(0, slash_pos);
+    if (catalog_part.find('@') != std::string_view::npos) {
+      cfg.format = LakehouseFormat::kInvalid;
+      cfg.error_message =
+          "Plaintext userinfo credentials ('user:pass@') are forbidden in "
+          "lakehouse CONNECTION/COMMENT URI; configure DuckDB secrets or "
+          "environment variables instead";
+      return cfg;
+    }
+    cfg.rest_catalog = std::string(catalog_part);
     std::string_view rest_target = body.substr(slash_pos + 1);
-    size_t sep_pos = rest_target.find('.');
+    size_t sep_pos = rest_target.rfind('.');
     if (sep_pos == std::string_view::npos) {
-      sep_pos = rest_target.find('/');
+      sep_pos = rest_target.rfind('/');
     }
     if (sep_pos == std::string_view::npos || sep_pos == 0 ||
-        sep_pos + 1 >= rest_target.size()) {
+        sep_pos + 1 >= rest_target.size() || rest_target.front() == '.' ||
+        rest_target.find("..") != std::string_view::npos) {
       cfg.format = LakehouseFormat::kInvalid;
       cfg.error_message =
           "Invalid iceberg_rest:// table identifier (expected "
@@ -408,9 +471,17 @@ std::string BuildDuckDBScanSql(const LakehouseTableConfig &config) {
     }
     case LakehouseFormat::kIcebergRest: {
       if (!config.table_path.empty()) {
-        return "iceberg_scan('" + EscapeSqlLiteral(config.table_path) +
-               "', allow_moved_paths := " +
-               (config.allow_moved_paths ? "true" : "false") + ")";
+        std::string sql =
+            "iceberg_scan('" + EscapeSqlLiteral(config.table_path) +
+            "', allow_moved_paths := " +
+            (config.allow_moved_paths ? "true" : "false");
+        if (config.iceberg_version.has_value() &&
+            !config.iceberg_version->empty()) {
+          sql +=
+              ", version := '" + EscapeSqlLiteral(*config.iceberg_version) + "'";
+        }
+        sql += ")";
+        return sql;
       }
       return QuoteSqlIdentifier(config.rest_catalog) + "." +
              QuoteSqlIdentifier(config.rest_namespace) + "." +

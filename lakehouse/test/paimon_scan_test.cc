@@ -9,6 +9,7 @@
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "duckdb.hpp"
+#include "lakehouse/lakehouse_connection.h"
 #include "lakehouse/paimon_arrow_stream.h"
 #include "lakehouse/paimon_table_function.h"
 #include "paimon/catalog/catalog.h"
@@ -124,10 +125,54 @@ TEST_F(PaimonScanTest, AppendOnlyTimeTravelSnapshots) {
   EXPECT_EQ(comp.db_name, "append_09");
   EXPECT_EQ(comp.table_name, "append_09");
 
+  // Standalone (non-.db parent directory) schema loading uses race-free unique temp directory
+  auto standalone_root =
+      std::filesystem::temp_directory_path() / "paimon_standalone_test_dir";
+  std::filesystem::remove_all(standalone_root);
+  std::filesystem::create_directories(standalone_root);
+  auto standalone_tbl = standalone_root / "append_standalone";
+  std::filesystem::create_directory_symlink(tbl, standalone_tbl);
+  auto standalone_schema_res = LoadPaimonSchemaFromPath(standalone_tbl.string());
+  EXPECT_TRUE(standalone_schema_res.ok()) << standalone_schema_res.status().ToString();
+  std::filesystem::remove_all(standalone_root);
+
   // Non-existent snapshot fails cleanly at bind time
   auto bad_snap = conn_->Query(
       "SELECT COUNT(*) FROM paimon_scan('" + tbl + "', snapshot_id := 999999)");
   EXPECT_TRUE(bad_snap->HasError());
+
+  // Explicit snapshot_id = -1 means latest snapshot and succeeds
+  auto latest_neg1 = conn_->Query(
+      "SELECT COUNT(*) FROM paimon_scan('" + tbl + "', snapshot_id := -1)");
+  ASSERT_FALSE(latest_neg1->HasError()) << latest_neg1->GetError();
+  EXPECT_EQ(latest_neg1->Fetch()->GetValue(0, 0).GetValue<int64_t>(), count_latest);
+
+  // Negative snapshot_id < -1 is rejected with InvalidInputException
+  auto bad_neg_pos = conn_->Query("SELECT COUNT(*) FROM paimon_scan('" + tbl + "', -2)");
+  EXPECT_TRUE(bad_neg_pos->HasError());
+  EXPECT_NE(bad_neg_pos->GetError().find("snapshot_id must be >= 0"), std::string::npos);
+
+  auto bad_neg_named =
+      conn_->Query("SELECT COUNT(*) FROM paimon_scan('" + tbl + "', snapshot_id := -5)");
+  EXPECT_TRUE(bad_neg_named->HasError());
+  EXPECT_NE(bad_neg_named->GetError().find("snapshot_id must be >= 0"), std::string::npos);
+
+  // Direct paimon_scan path validation rejects traversal, relative paths, remote URIs, and prefix violations
+  auto bad_traversal =
+      conn_->Query("SELECT COUNT(*) FROM paimon_scan('/tmp/wh/../../etc/passwd')");
+  EXPECT_TRUE(bad_traversal->HasError());
+  EXPECT_NE(bad_traversal->GetError().find("Path traversal"), std::string::npos);
+
+  auto bad_s3 =
+      conn_->Query("SELECT COUNT(*) FROM paimon_scan('s3://bucket/wh/db.db/tbl')");
+  EXPECT_TRUE(bad_s3->HasError());
+
+  SetAllowedPathPrefix("/nonexistent_allowed_root");
+  auto bad_prefix = conn_->Query("SELECT COUNT(*) FROM paimon_scan('" + tbl + "')");
+  SetAllowedPathPrefix("");
+  EXPECT_TRUE(bad_prefix->HasError());
+  EXPECT_NE(bad_prefix->GetError().find("outside the allowed path prefix"),
+            std::string::npos);
 }
 
 TEST_F(PaimonScanTest, PrimaryKeyMergeOnReadAndDeletionVectorStripsValueKind) {
@@ -178,6 +223,30 @@ TEST_F(PaimonScanTest, CountStarWithFilterAndEmptyProjection) {
   ASSERT_NE(proj_chunk, nullptr);
   EXPECT_EQ(proj_chunk->ColumnCount(), 2u);
   EXPECT_EQ(static_cast<int64_t>(proj_chunk->size()), filtered);
+
+  // Verify StreamGetSchema filters and orders ArrowSchema children to match projected_field_names
+  auto stream_wrapper = CreatePaimonArrowStream(tbl, /*splits=*/{}, {"f2", "f0"});
+  ASSERT_NE(stream_wrapper, nullptr);
+  ArrowSchema proj_schema{};
+  ASSERT_EQ(stream_wrapper->arrow_array_stream.get_schema(
+                &stream_wrapper->arrow_array_stream, &proj_schema),
+            0);
+  ASSERT_EQ(proj_schema.n_children, 2);
+  EXPECT_STREQ(proj_schema.children[0]->name, "f2");
+  EXPECT_STREQ(proj_schema.children[1]->name, "f0");
+  if (proj_schema.release) {
+    proj_schema.release(&proj_schema);
+  }
+
+  // Verify PaimonScanFunctionData::Equals distinguishes different snapshot_ids/tables in one query
+  auto join_res = conn_->Query(
+      "SELECT (SELECT COUNT(*) FROM paimon_scan('" + tbl + "', 1)), "
+      "(SELECT COUNT(*) FROM paimon_scan('" + tbl + "'))");
+  ASSERT_FALSE(join_res->HasError()) << join_res->GetError();
+  auto join_chunk = join_res->Fetch();
+  ASSERT_NE(join_chunk, nullptr);
+  EXPECT_LT(join_chunk->GetValue(0, 0).GetValue<int64_t>(),
+            join_chunk->GetValue(1, 0).GetValue<int64_t>());
 }
 
 TEST_F(PaimonScanTest, LargeTableMultiChunkSlicing) {

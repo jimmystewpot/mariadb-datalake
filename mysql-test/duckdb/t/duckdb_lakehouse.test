@@ -19,6 +19,7 @@ CREATE TABLE bad_secret (id INT) ENGINE=DuckDB
 CREATE TABLE bad_traversal (id INT) ENGINE=DuckDB
   CONNECTION='iceberg:///tmp/wh/../etc/passwd';
 
+--replace_regex /failed to load Paimon schema from '.*'/failed to load Paimon schema/
 --error ER_GET_ERRMSG
 CREATE TABLE bad_missing (id INT) ENGINE=DuckDB
   CONNECTION='paimon:///nonexistent/wh/db.db/tbl';

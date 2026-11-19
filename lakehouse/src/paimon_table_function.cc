@@ -24,6 +24,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "lakehouse/lakehouse_connection.h"
 #include "lakehouse/paimon_arrow_stream.h"
 #include "paimon/defs.h"
 #include "paimon/predicate/literal.h"
@@ -73,6 +74,11 @@ struct PaimonScanFunctionData : public duckdb::ArrowScanFunctionData {
   explicit PaimonScanFunctionData(duckdb::shared_ptr<PaimonScanFactory> paimon_factory_p)
       : duckdb::ArrowScanFunctionData(paimon_factory_p),
         paimon_factory(std::move(paimon_factory_p)) {}
+
+  bool Equals(const duckdb::FunctionData &other_p) const override {
+    const auto &other = other_p.Cast<PaimonScanFunctionData>();
+    return table_path == other.table_path && snapshot_id == other.snapshot_id;
+  }
 
   std::string table_path;
   int64_t snapshot_id = -1;
@@ -322,6 +328,10 @@ duckdb::unique_ptr<duckdb::FunctionData> PaimonBind(
   if (table_path.empty()) {
     throw duckdb::BinderException("paimon_scan requires a non-empty table_path argument");
   }
+  std::string path_err;
+  if (!ValidateLakehousePath(table_path, /*allow_remote=*/false, &path_err)) {
+    throw duckdb::InvalidInputException("paimon_scan: %s", path_err);
+  }
 
   int64_t snapshot_id = -1;
   if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
@@ -330,6 +340,10 @@ duckdb::unique_ptr<duckdb::FunctionData> PaimonBind(
   auto named_it = input.named_parameters.find("snapshot_id");
   if (named_it != input.named_parameters.end() && !named_it->second.IsNull()) {
     snapshot_id = named_it->second.GetValue<int64_t>();
+  }
+  if (snapshot_id < -1) {
+    throw duckdb::InvalidInputException(
+        "paimon_scan: snapshot_id must be >= 0 (or -1 for latest)");
   }
 
   auto schema_res = LoadPaimonSchemaFromPath(table_path);

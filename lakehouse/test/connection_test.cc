@@ -35,18 +35,58 @@ TEST(ConnectionTest, ParsesPaimonIcebergAndRestUrisWithOptions) {
   EXPECT_EQ(rest_cfg.rest_table, "events");
   EXPECT_EQ(rest_cfg.rest_endpoint, "http://127.0.0.1:18181");
   EXPECT_EQ(rest_cfg.rest_warehouse, "wh");
+
+  // Multi-level REST namespace splits at the last dot (rfind('.'))
+  auto multi_ns_cfg = ParseLakehouseUri(
+      "analytics", "orders",
+      "iceberg_rest://lake_cat/org.team.orders?endpoint=https://127.0.0.1:18181&warehouse=wh&version=v2");
+  EXPECT_EQ(multi_ns_cfg.format, LakehouseFormat::kIcebergRest);
+  EXPECT_EQ(multi_ns_cfg.rest_catalog, "lake_cat");
+  EXPECT_EQ(multi_ns_cfg.rest_namespace, "org.team");
+  EXPECT_EQ(multi_ns_cfg.rest_table, "orders");
+  ASSERT_TRUE(multi_ns_cfg.iceberg_version.has_value());
+  EXPECT_EQ(*multi_ns_cfg.iceberg_version, "v2");
 }
 
 TEST(ConnectionTest, RejectsPlaintextSecretsAndPathTraversal) {
   SetAllowedPathPrefix("");
   auto secret_uri = ParseLakehouseUri(
-      "db", "t", "paimon://s3://bucket/wh/db.db/t?secret_key=my_secret");
+      "db", "t", "paimon:///var/data/wh/db.db/t?secret_key=my_secret");
   EXPECT_EQ(secret_uri.format, LakehouseFormat::kInvalid);
   EXPECT_NE(secret_uri.error_message.find("credential"), std::string::npos);
 
+  // Rejects authority userinfo credentials (user:pass@) in table paths and REST endpoints
+  auto s3_userinfo = ParseLakehouseUri(
+      "db", "t", "iceberg://s3://user:pass@bucket/wh/db/t");
+  EXPECT_EQ(s3_userinfo.format, LakehouseFormat::kInvalid);
+  EXPECT_NE(s3_userinfo.error_message.find("credential"), std::string::npos);
+
+  auto rest_ep_userinfo = ParseLakehouseUri(
+      "db", "t",
+      "iceberg_rest://cat/ns.tbl?endpoint=http://user:pass@127.0.0.1:18181");
+  EXPECT_EQ(rest_ep_userinfo.format, LakehouseFormat::kInvalid);
+  EXPECT_NE(rest_ep_userinfo.error_message.find("credential"), std::string::npos);
+
+  auto rest_cat_userinfo = ParseLakehouseUri(
+      "db", "t",
+      "iceberg_rest://user:pass@cat/ns.tbl?endpoint=http://127.0.0.1:18181");
+  EXPECT_EQ(rest_cat_userinfo.format, LakehouseFormat::kInvalid);
+  EXPECT_NE(rest_cat_userinfo.error_message.find("credential"), std::string::npos);
+
+  // Rejects path traversal in table paths and REST endpoints
   auto traversal_uri = ParseLakehouseUri(
       "db", "t", "iceberg:///var/data/../../etc/passwd");
   EXPECT_EQ(traversal_uri.format, LakehouseFormat::kInvalid);
+
+  auto rest_ep_traversal = ParseLakehouseUri(
+      "db", "t",
+      "iceberg_rest://cat/ns.tbl?endpoint=http://127.0.0.1:18181/v1/../admin");
+  EXPECT_EQ(rest_ep_traversal.format, LakehouseFormat::kInvalid);
+
+  // Rejects paimon://s3://... because PAIMON_ENABLE_S3=OFF, while allowing iceberg://s3://...
+  auto paimon_s3 = ParseLakehouseUri("db", "t", "paimon://s3://bucket/wh/db.db/t");
+  EXPECT_EQ(paimon_s3.format, LakehouseFormat::kInvalid);
+  EXPECT_NE(paimon_s3.error_message.find("local filesystem"), std::string::npos);
 
   SetAllowedPathPrefix("/var/allowed");
   auto disallowed = ParseLakehouseUri("db", "t", "paimon:///tmp/other/db.db/t");

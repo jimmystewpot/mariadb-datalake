@@ -20,6 +20,7 @@ class LakehouseCatalog {
 
   void RegisterTable(const LakehouseTableConfig &config);
   void UnregisterTable(std::string_view schema_name, std::string_view table_name);
+  void UnregisterSchema(std::string_view schema_name);
   void RenameTable(std::string_view old_schema, std::string_view old_table,
                    std::string_view new_schema, std::string_view new_table);
   bool IsLakehouseTable(std::string_view schema_name,
@@ -40,6 +41,9 @@ class LakehouseCatalog {
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, LakehouseTableConfig> tables_;
 };
+
+bool IsDuckDBView(duckdb::Connection &conn, std::string_view schema_name,
+                  std::string_view table_name);
 
 bool ExecuteLakehouseCreateTable(
     duckdb::Connection &conn, const LakehouseTableConfig &cfg,
