@@ -41,4 +41,14 @@ class LakehouseCatalog {
   std::unordered_map<std::string, LakehouseTableConfig> tables_;
 };
 
+bool ExecuteLakehouseCreateTable(
+    duckdb::Connection &conn, const LakehouseTableConfig &cfg,
+    const std::vector<LakehouseColumnDecl> &cols,
+    std::string *error_out = nullptr);
+
+bool ExecuteLakehouseDropTable(duckdb::Connection &conn,
+                               std::string_view schema_name,
+                               std::string_view table_name,
+                               std::string *error_out = nullptr);
+
 }  // namespace myduck::lakehouse

@@ -1,0 +1,98 @@
+# Lakehouse integration tests for Apache Iceberg and Apache Paimon external
+# tables mapped as read-only MariaDB ENGINE=DuckDB views.
+
+--let $plugin_dir = $MTR_SUITE_DIR/../..
+--let $iceberg_orders_dir = $plugin_dir/lakehouse/test/fixtures/iceberg_v2_orders
+--let $paimon_append_dir = $plugin_dir/third_parties/paimon-cpp/test/test_data/parquet/append_09.db/append_09
+
+CREATE DATABASE lakehouse_db;
+USE lakehouse_db;
+
+--echo #
+--echo # 1) Security & DDL validation: reject plaintext credentials, path traversal, and missing paths
+--echo #
+--error ER_GET_ERRMSG
+CREATE TABLE bad_secret (id INT) ENGINE=DuckDB
+  CONNECTION='paimon:///tmp/wh/db.db/tbl?secret_key=my_leaky_secret';
+
+--error ER_GET_ERRMSG
+CREATE TABLE bad_traversal (id INT) ENGINE=DuckDB
+  CONNECTION='iceberg:///tmp/wh/../etc/passwd';
+
+--error ER_GET_ERRMSG
+CREATE TABLE bad_missing (id INT) ENGINE=DuckDB
+  CONNECTION='paimon:///nonexistent/wh/db.db/tbl';
+
+--echo #
+--echo # 2) Apache Iceberg v2 external table via CONNECTION='iceberg://...' (no PK required)
+--echo #
+--replace_result $iceberg_orders_dir ICEBERG_ORDERS_DIR
+eval CREATE TABLE orders (
+  order_id BIGINT,
+  f1 INT,
+  region VARCHAR(32),
+  amount DOUBLE
+) ENGINE=DuckDB CONNECTION='iceberg://$iceberg_orders_dir';
+
+SELECT order_id, f1, region, amount FROM orders WHERE region = 'APAC' ORDER BY order_id;
+
+--echo #
+--echo # 3) Apache Paimon external table via CONNECTION='paimon://...' and snapshot time-travel
+--echo #
+--replace_result $paimon_append_dir PAIMON_APPEND_DIR
+eval CREATE TABLE paimon_dim (
+  f0 VARCHAR(32),
+  f1 INT,
+  f2 INT,
+  f3 DOUBLE
+) ENGINE=DuckDB CONNECTION='paimon://$paimon_append_dir';
+
+SELECT COUNT(*) FROM paimon_dim;
+SELECT f0, f1, f2, f3 FROM paimon_dim WHERE f1 = 10 ORDER BY f0;
+
+--replace_result $paimon_append_dir PAIMON_APPEND_DIR
+eval CREATE TABLE paimon_dim_snap1 (
+  f0 VARCHAR(32),
+  f1 INT,
+  f2 INT,
+  f3 DOUBLE
+) ENGINE=DuckDB CONNECTION='paimon://$paimon_append_dir?snapshot_id=1';
+
+SELECT COUNT(*) FROM paimon_dim_snap1;
+
+--echo #
+--echo # 4) Federated join across Apache Iceberg and Apache Paimon tables
+--echo #
+SELECT o.order_id, o.region, p.f0, o.amount
+FROM orders AS o
+JOIN paimon_dim AS p ON o.f1 = p.f1
+WHERE o.region = 'APAC'
+ORDER BY o.order_id, p.f0
+LIMIT 5;
+
+--echo #
+--echo # 5) Read-only DML enforcement (HA_ERR_TABLE_READONLY)
+--echo #
+--error ER_OPEN_AS_READONLY
+INSERT INTO orders VALUES (999, 10, 'APAC', 1.0);
+
+--error ER_OPEN_AS_READONLY
+UPDATE orders SET amount = 0.0 WHERE order_id = 101;
+
+--error ER_OPEN_AS_READONLY
+DELETE FROM orders WHERE order_id = 101;
+
+--error ER_OPEN_AS_READONLY
+TRUNCATE TABLE orders;
+
+--echo #
+--echo # 6) RENAME TABLE and DROP TABLE lifecycle
+--echo #
+RENAME TABLE paimon_dim_snap1 TO paimon_dim_s1;
+SELECT COUNT(*) FROM paimon_dim_s1;
+
+DROP TABLE paimon_dim_s1;
+DROP TABLE paimon_dim;
+DROP TABLE orders;
+DROP DATABASE lakehouse_db;
+--source ../include/cleanup_duckdb.inc

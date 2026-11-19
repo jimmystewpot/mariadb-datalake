@@ -46,6 +46,8 @@
 #include "ha_duckdb_pushdown.h"
 #include "ha_duckdb_quack.h"
 #include "duckdb_log.h"
+#include "lakehouse/lakehouse_catalog.h"
+#include "lakehouse/lakehouse_connection.h"
 
 /* Global status counters */
 struct duckdb_status_t
@@ -363,6 +365,46 @@ ha_duckdb::~ha_duckdb() { my_bitmap_free(&m_blob_map); }
 
 /* ----- Basic handler methods ----- */
 
+bool ha_duckdb::is_lakehouse_table() const
+{
+  const TABLE_SHARE *s= (table && table->s) ? table->s : table_share;
+  if (!s)
+    return false;
+
+  std::string schema_name;
+  std::string table_name;
+  if (s->db.str && s->db.length > 0)
+    schema_name.assign(s->db.str, s->db.length);
+  if (s->table_name.str && s->table_name.length > 0)
+    table_name.assign(s->table_name.str, s->table_name.length);
+
+  if (!schema_name.empty() && !table_name.empty() &&
+      myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(
+          schema_name, table_name))
+  {
+    return true;
+  }
+
+  std::string_view connect_sv;
+  std::string_view comment_sv;
+  if (s->connect_string.str && s->connect_string.length > 0)
+    connect_sv= std::string_view(s->connect_string.str,
+                                 s->connect_string.length);
+  if (s->comment.str && s->comment.length > 0)
+    comment_sv= std::string_view(s->comment.str, s->comment.length);
+
+  auto cfg= myduck::lakehouse::ParseLakehouseUri(schema_name, table_name,
+                                                 connect_sv, comment_sv);
+  if (cfg.format != myduck::lakehouse::LakehouseFormat::kNone &&
+      cfg.format != myduck::lakehouse::LakehouseFormat::kInvalid)
+  {
+    if (!schema_name.empty() && !table_name.empty())
+      myduck::lakehouse::LakehouseCatalog::Instance().RegisterTable(cfg);
+    return true;
+  }
+  return false;
+}
+
 int ha_duckdb::open(const char *, int, uint)
 {
   DBUG_ENTER("ha_duckdb::open");
@@ -370,6 +412,7 @@ int ha_duckdb::open(const char *, int, uint)
   if (!(share= get_share()))
     DBUG_RETURN(1);
   thr_lock_data_init(&share->lock, &lock, nullptr);
+  (void) is_lakehouse_table();
 
   DBUG_RETURN(0);
 }
@@ -540,6 +583,8 @@ static void build_duckdb_blob_map(Field **field_list, MY_BITMAP *map)
 int ha_duckdb::write_row(const uchar *buf)
 {
   DBUG_ENTER("ha_duckdb::write_row");
+  if (is_lakehouse_table())
+    DBUG_RETURN(HA_ERR_TABLE_READONLY);
   int ret= 0;
   THD *thd= ha_thd();
 
@@ -741,6 +786,8 @@ void ha_duckdb::get_auto_increment(ulonglong offset, ulonglong increment,
 int ha_duckdb::update_row(const uchar *old_row, const uchar *new_row)
 {
   DBUG_ENTER("ha_duckdb::update_row");
+  if (is_lakehouse_table())
+    DBUG_RETURN(HA_ERR_TABLE_READONLY);
   int ret= 0;
   THD *thd= ha_thd();
 
@@ -806,6 +853,8 @@ int ha_duckdb::update_row(const uchar *old_row, const uchar *new_row)
 int ha_duckdb::delete_row(const uchar *)
 {
   DBUG_ENTER("ha_duckdb::delete_row");
+  if (is_lakehouse_table())
+    DBUG_RETURN(HA_ERR_TABLE_READONLY);
   int ret= 0;
   THD *thd= ha_thd();
 
@@ -1070,6 +1119,8 @@ int ha_duckdb::extra(enum ha_extra_function operation)
 int ha_duckdb::delete_all_rows()
 {
   DBUG_ENTER("ha_duckdb::delete_all_rows");
+  if (is_lakehouse_table())
+    DBUG_RETURN(HA_ERR_TABLE_READONLY);
   int ret= 0;
   THD *thd= ha_thd();
 
@@ -1106,6 +1157,8 @@ const COND *ha_duckdb::cond_push(const COND *)
 int ha_duckdb::direct_delete_rows_init()
 {
   DBUG_ENTER("ha_duckdb::direct_delete_rows_init");
+  if (is_lakehouse_table())
+    DBUG_RETURN(HA_ERR_TABLE_READONLY);
   DBUG_RETURN(0);
 }
 
@@ -1164,6 +1217,8 @@ int ha_duckdb::direct_update_rows_init(List<Item> *update_fields
                                        __attribute__((unused)))
 {
   DBUG_ENTER("ha_duckdb::direct_update_rows_init");
+  if (is_lakehouse_table())
+    DBUG_RETURN(HA_ERR_TABLE_READONLY);
   DBUG_RETURN(0);
 }
 
@@ -1262,6 +1317,42 @@ ha_rows ha_duckdb::records_in_range(uint, const key_range *, const key_range *,
 
 /* ----- DDL operations ----- */
 
+static myduck::lakehouse::LakehouseTableConfig parse_handler_lakehouse_config(
+    const std::string &schema_name, const std::string &table_name,
+    const TABLE *form, const HA_CREATE_INFO *create_info)
+{
+  std::string_view connect_sv;
+  std::string_view comment_sv;
+  if (create_info && create_info->connect_string.str &&
+      create_info->connect_string.length > 0)
+  {
+    connect_sv= std::string_view(create_info->connect_string.str,
+                                 create_info->connect_string.length);
+  }
+  else if (form && form->s && form->s->connect_string.str &&
+           form->s->connect_string.length > 0)
+  {
+    connect_sv= std::string_view(form->s->connect_string.str,
+                                 form->s->connect_string.length);
+  }
+
+  if (create_info && create_info->comment.str &&
+      create_info->comment.length > 0)
+  {
+    comment_sv= std::string_view(create_info->comment.str,
+                                 create_info->comment.length);
+  }
+  else if (form && form->s && form->s->comment.str &&
+           form->s->comment.length > 0)
+  {
+    comment_sv= std::string_view(form->s->comment.str,
+                                 form->s->comment.length);
+  }
+
+  return myduck::lakehouse::ParseLakehouseUri(schema_name, table_name,
+                                              connect_sv, comment_sv);
+}
+
 int ha_duckdb::create(const char *name, TABLE *form,
                       HA_CREATE_INFO *create_info)
 {
@@ -1282,12 +1373,44 @@ int ha_duckdb::create(const char *name, TABLE *form,
   std::string query= convertor.translate();
 
   auto *ctx= get_duckdb_context(thd);
+  auto lakehouse_cfg=
+      parse_handler_lakehouse_config(dt.db_name, dt.table_name, form,
+                                     create_info);
+  if (lakehouse_cfg.format ==
+          myduck::lakehouse::LakehouseFormat::kIcebergRest &&
+      lakehouse_cfg.table_path.empty())
+  {
+    std::string resolved_scan_sql;
+    std::string rest_error;
+    if (!myduck::lakehouse::LakehouseCatalog::Instance()
+             .AttachOrResolveIcebergRest(ctx->get_connection(), lakehouse_cfg,
+                                         &resolved_scan_sql, &rest_error))
+    {
+      my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_CREATE_ERROR,
+               rest_error.c_str(), "DuckDB");
+      DBUG_RETURN(HA_DUCKDB_CREATE_ERROR);
+    }
+    std::string placeholder=
+        "\nFROM " + myduck::lakehouse::BuildDuckDBScanSql(lakehouse_cfg) + ";";
+    size_t pos= query.rfind(placeholder);
+    if (pos != std::string::npos)
+      query.replace(pos, placeholder.size(),
+                    "\nFROM " + resolved_scan_sql + ";");
+  }
+
   auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
 
   if (query_result->HasError())
   {
     push_duckdb_query_error(query_result->GetError());
     DBUG_RETURN(HA_DUCKDB_CREATE_ERROR);
+  }
+
+  if (lakehouse_cfg.format != myduck::lakehouse::LakehouseFormat::kNone &&
+      lakehouse_cfg.format != myduck::lakehouse::LakehouseFormat::kInvalid)
+  {
+    myduck::lakehouse::LakehouseCatalog::Instance().RegisterTable(
+        lakehouse_cfg);
   }
 
   DBUG_RETURN(0);
@@ -1303,16 +1426,42 @@ int ha_duckdb::delete_table(const char *name)
     DBUG_RETURN(ret);
 
   DatabaseTableNames dt(name);
+  auto *ctx= get_duckdb_context(thd);
+
+  if (myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(
+          dt.db_name, dt.table_name) ||
+      is_lakehouse_table())
+  {
+    std::string view_query= "DROP VIEW IF EXISTS " +
+                            quote_duckdb_identifier(dt.db_name) + "." +
+                            quote_duckdb_identifier(dt.table_name);
+    auto view_result= myduck::duckdb_query(ctx->get_connection(), view_query);
+    if (view_result == nullptr || view_result->HasError())
+      DBUG_RETURN(HA_DUCKDB_DROP_TABLE_ERROR);
+    myduck::lakehouse::LakehouseCatalog::Instance().UnregisterTable(
+        dt.db_name, dt.table_name);
+    DBUG_RETURN(0);
+  }
 
   std::string query= "DROP TABLE IF EXISTS " +
                      quote_duckdb_identifier(dt.db_name) + "." +
                      quote_duckdb_identifier(dt.table_name);
 
-  auto *ctx= get_duckdb_context(thd);
   auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
 
   if (query_result == nullptr || query_result->HasError())
-    DBUG_RETURN(HA_DUCKDB_DROP_TABLE_ERROR);
+  {
+    /* Fallback in case a lakehouse view persisted across restart before open() */
+    std::string view_query= "DROP VIEW IF EXISTS " +
+                            quote_duckdb_identifier(dt.db_name) + "." +
+                            quote_duckdb_identifier(dt.table_name);
+    auto view_result= myduck::duckdb_query(ctx->get_connection(), view_query);
+    if (view_result == nullptr || view_result->HasError())
+      DBUG_RETURN(HA_DUCKDB_DROP_TABLE_ERROR);
+    myduck::lakehouse::LakehouseCatalog::Instance().UnregisterTable(
+        dt.db_name, dt.table_name);
+    DBUG_RETURN(0);
+  }
 
   /*
     Drop the AUTO_INCREMENT sequence, if any. It must go after the table:
@@ -1350,13 +1499,29 @@ int ha_duckdb::rename_table(const char *from, const char *to)
   if (convertor->check())
     DBUG_RETURN(HA_DUCKDB_RENAME_ERROR);
 
-  std::string query= convertor->translate();
-
   auto *ctx= get_duckdb_context(thd);
   std::string error_msg;
   ret= ctx->flush_appenders(error_msg);
   if (ret)
     DBUG_RETURN(ret);
+
+  if (myduck::lakehouse::LakehouseCatalog::Instance().IsLakehouseTable(
+          old_t.db_name, old_t.table_name) ||
+      is_lakehouse_table())
+  {
+    std::string view_rename=
+        "USE " + quote_duckdb_identifier(old_t.db_name) +
+        ";ALTER VIEW " + quote_duckdb_identifier(old_t.table_name) +
+        " RENAME TO " + quote_duckdb_identifier(new_t.table_name) + ";";
+    auto view_res= myduck::duckdb_query(ctx->get_connection(), view_rename);
+    if (view_res == nullptr || view_res->HasError())
+      DBUG_RETURN(HA_DUCKDB_RENAME_ERROR);
+    myduck::lakehouse::LakehouseCatalog::Instance().RenameTable(
+        old_t.db_name, old_t.table_name, new_t.db_name, new_t.table_name);
+    DBUG_RETURN(0);
+  }
+
+  std::string query= convertor->translate();
 
   auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
 
@@ -1369,6 +1534,8 @@ int ha_duckdb::rename_table(const char *from, const char *to)
 int ha_duckdb::truncate()
 {
   DBUG_ENTER("ha_duckdb::truncate");
+  if (is_lakehouse_table())
+    DBUG_RETURN(HA_ERR_TABLE_READONLY);
   THD *thd= ha_thd();
 
   int ret= duckdb_register_trx(thd);

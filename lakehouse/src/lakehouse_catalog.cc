@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "duckdb.hpp"
 #include "httplib.hpp"
 
 namespace myduck::lakehouse {
@@ -21,6 +22,20 @@ std::string MakeTableKey(std::string_view schema_name,
   key.push_back('\0');
   key.append(table_name);
   return key;
+}
+
+std::string QuoteSqlIdentifier(std::string_view identifier) {
+  std::string out;
+  out.reserve(identifier.size() + 4);
+  out.push_back('"');
+  for (char c : identifier) {
+    if (c == '"') {
+      out.push_back('"');
+    }
+    out.push_back(c);
+  }
+  out.push_back('"');
+  return out;
 }
 
 std::string EscapeSqlLiteral(std::string_view val) {
@@ -314,6 +329,79 @@ bool LakehouseCatalog::AttachOrResolveIcebergRest(
 void LakehouseCatalog::ClearForTesting() {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   tables_.clear();
+}
+
+bool ExecuteLakehouseCreateTable(
+    duckdb::Connection &conn, const LakehouseTableConfig &cfg,
+    const std::vector<LakehouseColumnDecl> &cols, std::string *error_out) {
+  auto set_error = [&](std::string msg) {
+    if (error_out != nullptr) {
+      *error_out = std::move(msg);
+    }
+    return false;
+  };
+
+  if (cfg.format == LakehouseFormat::kInvalid ||
+      cfg.format == LakehouseFormat::kNone) {
+    return set_error(cfg.error_message.empty()
+                         ? "Invalid or non-lakehouse table configuration"
+                         : cfg.error_message);
+  }
+  if (cols.empty()) {
+    return set_error("Lakehouse table must declare at least one column");
+  }
+
+  std::string ddl = TranslateLakehouseCreateView(cfg, cols);
+  if (ddl.empty()) {
+    return set_error("Failed to translate lakehouse view DDL");
+  }
+
+  if (cfg.format == LakehouseFormat::kIcebergRest && cfg.table_path.empty()) {
+    std::string resolved_scan_sql;
+    if (!LakehouseCatalog::Instance().AttachOrResolveIcebergRest(
+            conn, cfg, &resolved_scan_sql, error_out)) {
+      return false;
+    }
+    std::string placeholder = "\nFROM " + BuildDuckDBScanSql(cfg) + ";";
+    size_t pos = ddl.rfind(placeholder);
+    if (pos != std::string::npos) {
+      ddl.replace(pos, placeholder.size(), "\nFROM " + resolved_scan_sql + ";");
+    }
+  }
+
+  auto res = conn.Query(ddl);
+  if (!res || res->HasError()) {
+    return set_error(res ? res->GetError()
+                         : "DuckDB CREATE VIEW query returned null result");
+  }
+
+  LakehouseCatalog::Instance().RegisterTable(cfg);
+  if (error_out != nullptr) {
+    error_out->clear();
+  }
+  return true;
+}
+
+bool ExecuteLakehouseDropTable(duckdb::Connection &conn,
+                               std::string_view schema_name,
+                               std::string_view table_name,
+                               std::string *error_out) {
+  std::string drop_sql = "DROP VIEW IF EXISTS " +
+                         QuoteSqlIdentifier(schema_name) + "." +
+                         QuoteSqlIdentifier(table_name) + ";";
+  auto res = conn.Query(drop_sql);
+  if (!res || res->HasError()) {
+    if (error_out != nullptr) {
+      *error_out = res ? res->GetError()
+                       : "DuckDB DROP VIEW query returned null result";
+    }
+    return false;
+  }
+  LakehouseCatalog::Instance().UnregisterTable(schema_name, table_name);
+  if (error_out != nullptr) {
+    error_out->clear();
+  }
+  return true;
 }
 
 }  // namespace myduck::lakehouse

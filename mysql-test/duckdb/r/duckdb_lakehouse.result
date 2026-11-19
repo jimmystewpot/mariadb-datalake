@@ -1,0 +1,87 @@
+CREATE DATABASE lakehouse_db;
+USE lakehouse_db;
+#
+# 1) Security & DDL validation: reject plaintext credentials, path traversal, and missing paths
+#
+CREATE TABLE bad_secret (id INT) ENGINE=DuckDB
+CONNECTION='paimon:///tmp/wh/db.db/tbl?secret_key=my_leaky_secret';
+ERROR HY000: Got error 140 'Plaintext credential parameter 'secret_key' is forbidden in lakehouse CONNECTION/COMMENT URI; configure DuckDB secrets or environment variables instead' from DuckDB
+CREATE TABLE bad_traversal (id INT) ENGINE=DuckDB
+CONNECTION='iceberg:///tmp/wh/../etc/passwd';
+ERROR HY000: Got error 140 'Path traversal ('..') is not allowed in lakehouse CONNECTION URI' from DuckDB
+CREATE TABLE bad_missing (id INT) ENGINE=DuckDB
+CONNECTION='paimon:///nonexistent/wh/db.db/tbl';
+ERROR HY000: Got error 168 'Invalid Input Error: paimon_scan: failed to load table schema from '/nonexistent/wh/db.db/tbl'' from DuckDB
+#
+# 2) Apache Iceberg v2 external table via CONNECTION='iceberg://...' (no PK required)
+#
+CREATE TABLE orders (
+order_id BIGINT,
+f1 INT,
+region VARCHAR(32),
+amount DOUBLE
+) ENGINE=DuckDB CONNECTION='iceberg://ICEBERG_ORDERS_DIR';
+SELECT order_id, f1, region, amount FROM orders WHERE region = 'APAC' ORDER BY order_id;
+order_id	f1	region	amount
+101	10	APAC	250.5
+103	20	APAC	99.95
+#
+# 3) Apache Paimon external table via CONNECTION='paimon://...' and snapshot time-travel
+#
+CREATE TABLE paimon_dim (
+f0 VARCHAR(32),
+f1 INT,
+f2 INT,
+f3 DOUBLE
+) ENGINE=DuckDB CONNECTION='paimon://PAIMON_APPEND_DIR';
+SELECT COUNT(*) FROM paimon_dim;
+COUNT(*)
+6
+SELECT f0, f1, f2, f3 FROM paimon_dim WHERE f1 = 10 ORDER BY f0;
+f0	f1	f2	f3
+aaa	10	1	1.1
+bbb	10	2	2.2
+CREATE TABLE paimon_dim_snap1 (
+f0 VARCHAR(32),
+f1 INT,
+f2 INT,
+f3 DOUBLE
+) ENGINE=DuckDB CONNECTION='paimon://PAIMON_APPEND_DIR?snapshot_id=1';
+SELECT COUNT(*) FROM paimon_dim_snap1;
+COUNT(*)
+5
+#
+# 4) Federated join across Apache Iceberg and Apache Paimon tables
+#
+SELECT o.order_id, o.region, p.f0, o.amount
+FROM orders AS o
+JOIN paimon_dim AS p ON o.f1 = p.f1
+WHERE o.region = 'APAC'
+ORDER BY o.order_id, p.f0
+LIMIT 5;
+order_id	region	f0	amount
+101	APAC	aaa	250.5
+101	APAC	bbb	250.5
+103	APAC	ccc	99.95
+#
+# 5) Read-only DML enforcement (HA_ERR_TABLE_READONLY)
+#
+INSERT INTO orders VALUES (999, 10, 'APAC', 1.0);
+ERROR HY000: Table 'orders' is read only
+UPDATE orders SET amount = 0.0 WHERE order_id = 101;
+ERROR HY000: Table 'orders' is read only
+DELETE FROM orders WHERE order_id = 101;
+ERROR HY000: Table 'orders' is read only
+TRUNCATE TABLE orders;
+ERROR HY000: Table 'orders' is read only
+#
+# 6) RENAME TABLE and DROP TABLE lifecycle
+#
+RENAME TABLE paimon_dim_snap1 TO paimon_dim_s1;
+SELECT COUNT(*) FROM paimon_dim_s1;
+COUNT(*)
+5
+DROP TABLE paimon_dim_s1;
+DROP TABLE paimon_dim;
+DROP TABLE orders;
+DROP DATABASE lakehouse_db;

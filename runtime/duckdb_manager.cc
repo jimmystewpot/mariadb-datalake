@@ -34,6 +34,7 @@
 #include "duckdb_mariadb_tz.h"
 #include "mariadb_dialect.h"
 #include "duckdb/parser/sql_statement.hpp"
+#include "lakehouse/paimon_table_function.h"
 #include "quack_guard/quack_guard.hpp"
 
 /* Defined by the generated duckdb_static_extension_loader.c */
@@ -305,6 +306,9 @@ bool DuckdbManager::Initialize()
 
     /* Register cross-engine scan support (_mdb_scan + replacement scan) */
     register_cross_engine_scan(*m_database->instance);
+
+    /* Register Apache Paimon custom table function (paimon_scan) */
+    myduck::lakehouse::RegisterPaimonScan(*m_database->instance);
 
     /* Quack: stock entry points closed, sessions guarded (MDEV-41383) */
     m_quack_guard= quack_guard::Install(*m_database->instance, *con);

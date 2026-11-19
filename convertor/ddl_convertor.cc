@@ -29,6 +29,8 @@
 #undef UNKNOWN
 #include "duckdb_charset_collation.h"
 #include "duckdb_config.h"
+#include "duckdb_handler_errors.h"
+#include "lakehouse/lakehouse_connection.h"
 #include "mariadb_lexical_guard.h" /* myduck::mariadb_query_has_lexical_mismatch */
 #include "sql_class.h"
 #include "sql_alter.h"
@@ -724,6 +726,42 @@ std::string FieldConvertor::convert_type(const Field *field)
 
 /* ----- CreateTableConvertor ----- */
 
+static myduck::lakehouse::LakehouseTableConfig extract_lakehouse_config(
+    const std::string &schema_name, const std::string &table_name,
+    const TABLE *table, const HA_CREATE_INFO *create_info)
+{
+  std::string_view connect_sv;
+  std::string_view comment_sv;
+  if (create_info && create_info->connect_string.str &&
+      create_info->connect_string.length > 0)
+  {
+    connect_sv= std::string_view(create_info->connect_string.str,
+                                 create_info->connect_string.length);
+  }
+  else if (table && table->s && table->s->connect_string.str &&
+           table->s->connect_string.length > 0)
+  {
+    connect_sv= std::string_view(table->s->connect_string.str,
+                                 table->s->connect_string.length);
+  }
+
+  if (create_info && create_info->comment.str &&
+      create_info->comment.length > 0)
+  {
+    comment_sv= std::string_view(create_info->comment.str,
+                                 create_info->comment.length);
+  }
+  else if (table && table->s && table->s->comment.str &&
+           table->s->comment.length > 0)
+  {
+    comment_sv= std::string_view(table->s->comment.str,
+                                 table->s->comment.length);
+  }
+
+  return myduck::lakehouse::ParseLakehouseUri(schema_name, table_name,
+                                              connect_sv, comment_sv);
+}
+
 bool CreateTableConvertor::check()
 {
   Field **first_field= m_table->field;
@@ -747,6 +785,21 @@ bool CreateTableConvertor::check()
   {
     my_error(ER_TABLE_CANT_HANDLE_AUTO_INCREMENT, MYF(0), "DUCKDB");
     return true;
+  }
+
+  auto lakehouse_cfg= extract_lakehouse_config(m_schema_name, m_table_name,
+                                               m_table, m_create_info);
+  if (lakehouse_cfg.format != myduck::lakehouse::LakehouseFormat::kNone)
+  {
+    if (lakehouse_cfg.format == myduck::lakehouse::LakehouseFormat::kInvalid)
+    {
+      my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_CREATE_ERROR,
+               lakehouse_cfg.error_message.c_str(), "DuckDB");
+      return true;
+    }
+    /* External lakehouse tables are read-only analytical relations that do not
+       support row-by-row UPDATE/DELETE, so skip require_primary_key. */
+    return false;
   }
 
   /* Check PK. */
@@ -789,6 +842,24 @@ std::string CreateTableConvertor::translate()
 {
   std::ostringstream result;
   assert((m_create_info->options & HA_LEX_CREATE_TMP_TABLE) == 0);
+
+  auto lakehouse_cfg= extract_lakehouse_config(m_schema_name, m_table_name,
+                                               m_table, m_create_info);
+  if (lakehouse_cfg.format != myduck::lakehouse::LakehouseFormat::kNone &&
+      lakehouse_cfg.format != myduck::lakehouse::LakehouseFormat::kInvalid)
+  {
+    std::vector<myduck::lakehouse::LakehouseColumnDecl> cols;
+    for (Field **ptr= m_table->field; *ptr; ptr++)
+    {
+      Field *field= *ptr;
+      if (field->invisible >= INVISIBLE_USER)
+        continue;
+      cols.push_back({std::string(field->field_name.str,
+                                  field->field_name.length),
+                      FieldConvertor::convert_type(field)});
+    }
+    return myduck::lakehouse::TranslateLakehouseCreateView(lakehouse_cfg, cols);
+  }
 
   result << "CREATE SCHEMA IF NOT EXISTS "
          << quote_duckdb_identifier(m_schema_name) << ";";

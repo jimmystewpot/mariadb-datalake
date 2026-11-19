@@ -38,6 +38,8 @@
 #include "duckdb/common/types.hpp"
 
 #include "duckdb_handler_errors.h"
+#include "lakehouse/lakehouse_catalog.h"
+#include "lakehouse/lakehouse_connection.h"
 
 extern handlerton *duckdb_hton;
 
@@ -192,6 +194,8 @@ public:
                                   bool commit) override;
 
 private:
+  bool is_lakehouse_table() const;
+
   std::unique_ptr<duckdb::QueryResult> query_result;
   std::unique_ptr<duckdb::DataChunk> current_chunk;
   size_t current_row_index= 0;
