@@ -1,0 +1,11 @@
+/build/
+build/
+/.superpowers/
+.superpowers/
+/.worktrees/
+.worktrees/
+/compile_commands.json
+/.cache/
+/.claude/
+# Written to the source dir by the MariaDB plugin SDK on configure
+/mariadb-plugin-*.yml

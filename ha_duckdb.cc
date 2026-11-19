@@ -1,0 +1,1973 @@
+/*
+  Copyright (c) 2026, MariaDB Foundation.
+  Copyright (c) 2026, Roman Nozdrin <drrtuy@gmail.com>
+  Copyright (c) 2026, Leonid Fedorov.
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; version 2 of the License.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335 USA
+*/
+
+#include "ha_duckdb.h"
+
+#include <algorithm>
+#include <cctype>
+
+#include <my_global.h>
+#include <mysql/plugin.h>
+#include <mysql/plugin_function.h>
+#include "bridge/bridge.h"
+#include "duckdb_manager.h"
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include "sql_class.h"
+#include "sql_table.h"
+
+#include "duckdb_manager.h"
+#include "duckdb_context.h"
+#include "duckdb_query.h"
+#include "duckdb_config.h"
+#include "duckdb_types.h"
+#include "duckdb_select.h"
+#include "ddl_convertor.h"
+#include "dml_convertor.h"
+#include "row_helpers.h"
+#include "ha_duckdb_pushdown.h"
+#include "ha_duckdb_quack.h"
+#include "duckdb_log.h"
+
+/* Global status counters */
+struct duckdb_status_t
+{
+  ulonglong duckdb_rows_insert;
+  ulonglong duckdb_rows_update;
+  ulonglong duckdb_rows_delete;
+  ulonglong duckdb_rows_insert_in_batch;
+  ulonglong duckdb_rows_update_in_batch;
+  ulonglong duckdb_rows_delete_in_batch;
+  ulonglong duckdb_commit;
+  ulonglong duckdb_rollback;
+};
+
+static duckdb_status_t srv_duckdb_status;
+
+/* Plugin variables */
+static my_bool copy_ddl_in_batch= TRUE;
+static my_bool dml_in_batch= TRUE;
+static my_bool update_modified_column_only= TRUE;
+static ulonglong autoinc_cache_size= 1000;
+
+static handler *duckdb_create_handler(handlerton *hton, TABLE_SHARE *table,
+                                      MEM_ROOT *mem_root);
+
+handlerton *duckdb_hton;
+
+/* ----- Per-thread context via thd_get_ha_data / thd_set_ha_data ----- */
+
+static myduck::DuckdbThdContext *get_duckdb_context(THD *thd)
+{
+  auto *ctx= static_cast<myduck::DuckdbThdContext *>(
+      thd_get_ha_data(thd, duckdb_hton));
+  if (!ctx)
+  {
+    ctx= new myduck::DuckdbThdContext();
+    thd_set_ha_data(thd, duckdb_hton, ctx);
+  }
+  return ctx;
+}
+
+/* ----- Transaction callbacks ----- */
+
+#if MYSQL_VERSION_ID >= 110800
+static int duckdb_prepare(THD *thd, bool all)
+#else
+static int duckdb_prepare(handlerton *hton, THD *thd, bool all)
+#endif
+{
+  if (all || !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))
+  {
+    std::string error_msg;
+    auto *ctx= get_duckdb_context(thd);
+    if (ctx->flush_appenders(error_msg))
+    {
+      my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_APPEND_ERROR, error_msg.c_str(), "DuckDB");
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void push_duckdb_query_error(const std::string &err)
+{
+  if (err.find("Parser Error") != std::string::npos ||
+      err.find("syntax error") != std::string::npos)
+  {
+    my_error(ER_PARSE_ERROR, MYF(0), err.c_str());
+    return;
+  }
+
+  my_error(ER_GET_ERRMSG, MYF(0), HA_ERR_GENERIC, err.c_str(), "DuckDB");
+}
+
+#if MYSQL_VERSION_ID >= 110800
+static int duckdb_commit(THD *thd, bool commit_trx)
+#else
+static int duckdb_commit(handlerton *hton, THD *thd, bool commit_trx)
+#endif
+{
+  if (commit_trx ||
+      (!thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)))
+  {
+    srv_duckdb_status.duckdb_commit++;
+
+    std::string error_msg;
+    auto *ctx= get_duckdb_context(thd);
+
+    /* Safety net: flush if prepare() was not called (no 2PC).
+       This is a no-op when appenders were already flushed. */
+    if (ctx->flush_appenders(error_msg))
+    {
+      my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_APPEND_ERROR, error_msg.c_str(), "DuckDB");
+      ctx->duckdb_trans_rollback(error_msg);
+      return 1;
+    }
+
+    if (ctx->duckdb_trans_commit(error_msg))
+    {
+      my_error(ER_GET_ERRMSG, MYF(0), HA_ERR_GENERIC, error_msg.c_str(), "DuckDB");
+      ctx->duckdb_trans_rollback(error_msg);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+#if MYSQL_VERSION_ID >= 110800
+static int duckdb_rollback(THD *thd, bool rollback_trx)
+#else
+static int duckdb_rollback(handlerton *hton, THD *thd, bool rollback_trx)
+#endif
+{
+  if (rollback_trx ||
+      !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))
+  {
+    srv_duckdb_status.duckdb_rollback++;
+
+    std::string error_msg;
+    auto *ctx= get_duckdb_context(thd);
+    if (ctx->duckdb_trans_rollback(error_msg))
+    {
+      my_error(ER_GET_ERRMSG, MYF(0), HA_ERR_GENERIC, error_msg.c_str(), "DuckDB");
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* XAER_NOTA ("unknown XID") of the X/Open XA spec; the server headers
+   do not define it. */
+static constexpr int DUCKDB_XAER_NOTA= -4;
+
+/*
+  XA recovery hooks.  prepare() only flushes buffered DML into the open
+  DuckDB transaction so that errors surface before the binlog is written;
+  nothing prepared survives a restart, and explicit XA is refused
+  (reject_xa_if_active()), so there is never an in-doubt DuckDB
+  transaction to report or resolve.
+
+  They are still required: with the binlog on, a DuckDB write commits
+  through 2PC with an XID, and the server counts the read-write
+  participants that have recover() when it writes the GTID event.  A
+  DuckDB-only transaction would count zero, which trips an assertion in
+  debug servers and wraps the engine count in the event in release ones.
+
+  Because prepare() is not durable, a crash between the binlog write and
+  the DuckDB commit loses the DuckDB part of a binlogged transaction, and
+  semisync-replica binlog truncation cannot protect it either; registering
+  these hooks does not change that.
+*/
+#if MYSQL_VERSION_ID >= 110800
+static int duckdb_recover(XID *, uint)
+#else
+static int duckdb_recover(handlerton *, XID *, uint)
+#endif
+{
+  return 0;
+}
+
+#if MYSQL_VERSION_ID >= 110800
+static int duckdb_commit_or_rollback_by_xid(XID *)
+#else
+static int duckdb_commit_or_rollback_by_xid(handlerton *, XID *)
+#endif
+{
+  return DUCKDB_XAER_NOTA;
+}
+
+#if MYSQL_VERSION_ID >= 110800
+static int duckdb_close_connection(THD *thd)
+#else
+static int duckdb_close_connection(handlerton *hton, THD *thd)
+#endif
+{
+  auto *ctx= static_cast<myduck::DuckdbThdContext *>(
+      thd_get_ha_data(thd, duckdb_hton));
+  if (ctx)
+  {
+    /* Unpublish first: duckdb_kill_query() reads it under LOCK_thd_data. */
+    thd_set_ha_data(thd, duckdb_hton, nullptr);
+    delete ctx;
+  }
+  return 0;
+}
+
+static void duckdb_kill_query(handlerton *, THD *thd, enum thd_kill_levels)
+{
+  auto *ctx= static_cast<myduck::DuckdbThdContext *>(
+      thd_get_ha_data(thd, duckdb_hton));
+  if (ctx)
+    ctx->interrupt();
+}
+
+static int duckdb_register_trx(THD *thd)
+{
+  auto *ctx= get_duckdb_context(thd);
+  std::string error_msg;
+  if (ctx->duckdb_trans_begin(error_msg))
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_ERR_GENERIC, error_msg.c_str(),
+             "DuckDB");
+    return HA_ERR_GENERIC;
+  }
+
+  trans_register_ha(thd, false, duckdb_hton, 0);
+
+  if (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))
+    trans_register_ha(thd, true, duckdb_hton, 0);
+
+  return 0;
+}
+
+static void duckdb_drop_database(handlerton *hton, char *path)
+{
+  THD *thd= current_thd;
+  DBUG_ENTER("duckdb_drop_database");
+
+  Databasename db(path);
+
+  std::string query= "DROP SCHEMA IF EXISTS " + quote_duckdb_identifier(db.name);
+
+  if (duckdb_register_trx(thd))
+    DBUG_VOID_RETURN;
+  auto *ctx= get_duckdb_context(thd);
+  auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
+  DBUG_VOID_RETURN;
+}
+
+/* ----- Handlerton init ----- */
+
+static int duckdb_init_func(void *p)
+{
+  DBUG_ENTER("duckdb_init_func");
+
+  duckdb_hton= (handlerton *) p;
+  duckdb_hton->db_type= DB_TYPE_AUTOASSIGN;
+  duckdb_hton->create= duckdb_create_handler;
+  duckdb_hton->flags= HTON_TEMPORARY_NOT_SUPPORTED | HTON_NO_PARTITION;
+  duckdb_hton->prepare= duckdb_prepare;
+  duckdb_hton->commit= duckdb_commit;
+  duckdb_hton->rollback= duckdb_rollback;
+  duckdb_hton->recover= duckdb_recover;
+  duckdb_hton->commit_by_xid= duckdb_commit_or_rollback_by_xid;
+  duckdb_hton->rollback_by_xid= duckdb_commit_or_rollback_by_xid;
+  duckdb_hton->close_connection= duckdb_close_connection;
+  duckdb_hton->kill_query= duckdb_kill_query;
+  duckdb_hton->drop_database= duckdb_drop_database;
+
+  duckdb_hton->create_select= create_duckdb_select_handler;
+  duckdb_hton->create_unit= create_duckdb_unit_handler;
+
+  if (myduck::DuckdbManager::CreateInstance())
+  {
+    sql_print_error("DuckDB: failed to create DuckdbManager instance");
+    DBUG_RETURN(1);
+  }
+
+  quack_init(duckdb_hton);
+
+  sql_print_information("DuckDB storage engine initialized");
+  DBUG_RETURN(0);
+}
+
+static int duckdb_deinit_func(void *p)
+{
+  DBUG_ENTER("duckdb_deinit_func");
+  quack_stop();
+  myduck::DuckdbManager::Cleanup();
+  DBUG_RETURN(0);
+}
+
+/* ----- Share management ----- */
+
+Duckdb_share::Duckdb_share()
+{
+  thr_lock_init(&lock);
+  mysql_mutex_init(PSI_INSTRUMENT_ME, &autoinc_refill_mutex,
+                   MY_MUTEX_INIT_FAST);
+}
+
+Duckdb_share *ha_duckdb::get_share()
+{
+  Duckdb_share *tmp_share;
+  DBUG_ENTER("ha_duckdb::get_share()");
+
+  lock_shared_ha_data();
+  if (!(tmp_share= static_cast<Duckdb_share *>(get_ha_share_ptr())))
+  {
+    tmp_share= new Duckdb_share;
+    if (!tmp_share)
+      goto err;
+    set_ha_share_ptr(static_cast<Handler_share *>(tmp_share));
+  }
+err:
+  unlock_shared_ha_data();
+  DBUG_RETURN(tmp_share);
+}
+
+/* ----- Handler creation ----- */
+
+static handler *duckdb_create_handler(handlerton *hton, TABLE_SHARE *table,
+                                      MEM_ROOT *mem_root)
+{
+  return new (mem_root) ha_duckdb(hton, table);
+}
+
+ha_duckdb::ha_duckdb(handlerton *hton, TABLE_SHARE *table_arg)
+    : handler(hton, table_arg)
+{
+  my_bitmap_init(&m_blob_map, nullptr, MAX_FIELDS);
+}
+
+ha_duckdb::~ha_duckdb() { my_bitmap_free(&m_blob_map); }
+
+/* ----- Basic handler methods ----- */
+
+int ha_duckdb::open(const char *, int, uint)
+{
+  DBUG_ENTER("ha_duckdb::open");
+
+  if (!(share= get_share()))
+    DBUG_RETURN(1);
+  thr_lock_data_init(&share->lock, &lock, nullptr);
+
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::close(void)
+{
+  DBUG_ENTER("ha_duckdb::close");
+  DBUG_RETURN(0);
+}
+
+/* ----- DML helpers ----- */
+
+static int execute_dml(THD *thd, DMLConvertor *convertor)
+{
+  if (convertor->check())
+    return HA_DUCKDB_DML_ERROR;
+
+  auto query= convertor->translate();
+  auto *ctx= get_duckdb_context(thd);
+  auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
+
+  if (query_result->HasError())
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_DML_ERROR, query_result->GetError().c_str(), "DuckDB");
+    return HA_DUCKDB_DML_ERROR;
+  }
+
+  return 0;
+}
+
+/* check whether field is modified */
+static bool calc_field_difference(const uchar *old_row, const uchar *new_row,
+                                  TABLE *table, Field *field)
+{
+  ulong o_len;
+  ulong n_len;
+  const uchar *o_ptr;
+  const uchar *n_ptr;
+
+  o_ptr= (const uchar *) old_row + field->offset(table->record[0]);
+  n_ptr= (const uchar *) new_row + field->offset(table->record[0]);
+
+  o_len= n_len= field->pack_length();
+
+  switch (field->type())
+  {
+  case MYSQL_TYPE_VARCHAR:
+    o_ptr= row_mysql_read_true_varchar(
+        &o_len, o_ptr, (ulong) ((Field_varstring *) field)->length_bytes);
+    n_ptr= row_mysql_read_true_varchar(
+        &n_len, n_ptr, (ulong) ((Field_varstring *) field)->length_bytes);
+    break;
+  case MYSQL_TYPE_GEOMETRY:
+  case MYSQL_TYPE_TINY_BLOB:
+  case MYSQL_TYPE_MEDIUM_BLOB:
+  case MYSQL_TYPE_BLOB:
+  case MYSQL_TYPE_LONG_BLOB:
+    o_ptr= row_mysql_read_blob_ref(&o_len, o_ptr, o_len);
+    n_ptr= row_mysql_read_blob_ref(&n_len, n_ptr, n_len);
+    break;
+  default:;
+  }
+
+  if (field->real_maybe_null())
+  {
+    if (field->is_null_in_record(old_row))
+      o_len= ~0U;
+    if (field->is_null_in_record(new_row))
+      n_len= ~0U;
+  }
+
+  return o_len != n_len ||
+         (o_len != ~0U && o_len != 0 && 0 != memcmp(o_ptr, n_ptr, o_len));
+}
+
+/* calculate row difference, set bit for modified columns in table->tmp_set */
+static bool calc_row_difference(const uchar *old_row, const uchar *new_row,
+                                TABLE *table)
+{
+  bool res= false;
+  bitmap_clear_all(&table->tmp_set);
+
+  for (uint i= 0; i < table->s->fields; i++)
+  {
+    Field *field= table->field[i];
+    if (calc_field_difference(old_row, new_row, table, field))
+    {
+      bitmap_set_bit(&table->tmp_set, field->field_index);
+      res= true;
+    }
+  }
+  return res;
+}
+
+/* check whether PK is modified */
+static bool calc_pk_difference(const uchar *old_row, const uchar *new_row,
+                               TABLE *table) __attribute__((unused));
+static bool calc_pk_difference(const uchar *old_row, const uchar *new_row,
+                               TABLE *table)
+{
+  KEY *key_info= table->key_info;
+  if (!key_info)
+    return false;
+
+  KEY_PART_INFO *key_part= table->key_info->key_part;
+  for (uint j= 0; j < key_info->user_defined_key_parts; j++, key_part++)
+  {
+    if (calc_field_difference(old_row, new_row, table, key_part->field))
+      return true;
+  }
+  return false;
+}
+
+static int get_batch_state(THD *thd, bool insert_only,
+                           myduck::BatchState *batch_state)
+{
+  auto *ctx= get_duckdb_context(thd);
+  *batch_state= ctx->get_batch_state();
+
+  if (*batch_state == myduck::BatchState::IN_INSERT_ONLY_BATCH &&
+      !insert_only)
+  {
+    std::string error_msg;
+    if (ctx->flush_appenders(error_msg))
+    {
+      my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_APPEND_ERROR,
+               error_msg.c_str(), "DuckDB");
+      return HA_DUCKDB_APPEND_ERROR;
+    }
+    *batch_state= myduck::BatchState::UNDEFINED;
+  }
+
+  if (*batch_state == myduck::BatchState::UNDEFINED)
+  {
+    if (!dml_in_batch)
+      *batch_state= myduck::BatchState::NOT_IN_BATCH;
+    else if (insert_only)
+      *batch_state= myduck::BatchState::IN_INSERT_ONLY_BATCH;
+    else
+      *batch_state= myduck::BatchState::IN_MIX_BATCH;
+    ctx->set_batch_state(*batch_state);
+  }
+  return 0;
+}
+
+/* Build duckdb type map of blob type */
+static void build_duckdb_blob_map(Field **field_list, MY_BITMAP *map)
+{
+  for (Field **f_ptr= field_list; *f_ptr != nullptr; f_ptr++)
+  {
+    Field *field= *f_ptr;
+    enum_field_types type= field->real_type();
+
+    if (type == MYSQL_TYPE_SET || type == MYSQL_TYPE_ENUM ||
+        type == MYSQL_TYPE_BIT || type == MYSQL_TYPE_GEOMETRY ||
+        type == MYSQL_TYPE_VARCHAR || type == MYSQL_TYPE_STRING ||
+        type == MYSQL_TYPE_TINY_BLOB || type == MYSQL_TYPE_BLOB ||
+        type == MYSQL_TYPE_MEDIUM_BLOB || type == MYSQL_TYPE_LONG_BLOB)
+    {
+      if (FieldConvertor::convert_type(field) == "BLOB")
+        bitmap_set_bit(map, field->field_index);
+    }
+  }
+}
+
+/* ----- DML operations ----- */
+
+int ha_duckdb::write_row(const uchar *buf)
+{
+  DBUG_ENTER("ha_duckdb::write_row");
+  int ret= 0;
+  THD *thd= ha_thd();
+
+  DBUG_ASSERT(table_share != nullptr && table != nullptr);
+  MY_BITMAP *org_bitmap= dbug_tmp_use_all_columns(table, &table->read_set);
+
+  ret= duckdb_register_trx(thd);
+  if (ret)
+  {
+    dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
+    DBUG_RETURN(ret);
+  }
+
+  /*
+    Fill the AUTO_INCREMENT field. Every row reaches DuckDB with all columns
+    materialized (both the Appender and the SQL insert paths), so the value
+    must be assigned here; the sequence-backed column default in DuckDB is
+    never consulted on this path.
+  */
+  if (table->next_number_field && buf == table->record[0] &&
+      (ret= update_auto_increment()))
+  {
+    dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
+    DBUG_RETURN(ret);
+  }
+
+  myduck::BatchState batch_state;
+  ret= get_batch_state(thd, true, &batch_state);
+  if (ret)
+  {
+    dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
+    DBUG_RETURN(ret);
+  }
+
+  if (batch_state == myduck::BatchState::NOT_IN_BATCH)
+  {
+    InsertConvertor convertor(table, false);
+    ret= execute_dml(thd, &convertor);
+    if (ret == 0)
+      srv_duckdb_status.duckdb_rows_insert++;
+  }
+  else
+  {
+    if (m_first_write)
+    {
+      build_duckdb_blob_map(table->field, &m_blob_map);
+      m_first_write= false;
+    }
+    auto *ctx= get_duckdb_context(thd);
+    ret= ctx->append_row_insert(table, &m_blob_map);
+    if (ret == 0)
+      srv_duckdb_status.duckdb_rows_insert_in_batch++;
+    else
+    {
+      /* Appender failed (e.g. table not yet created during ALTER TABLE).
+         Fall back to non-batch SQL insert. */
+      ctx->set_batch_state(myduck::BatchState::NOT_IN_BATCH);
+      InsertConvertor convertor(table, false);
+      ret= execute_dml(thd, &convertor);
+      if (ret == 0)
+        srv_duckdb_status.duckdb_rows_insert++;
+    }
+  }
+
+  dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
+  DBUG_RETURN(ret);
+}
+
+/*
+  Consume `want` ids from the table's AUTO_INCREMENT sequence in one query
+  and return the first id of the block, or 0 on failure (a sequence value is
+  never 0: CREATE SEQUENCE is emitted with START WITH >= 1).
+
+  nextval() calls of a concurrent DuckDB-side writer (batch ingestion through
+  run_in_duckdb relying on the column default) may interleave with ours
+  inside this query. The ids missing from our span belong to that writer, so
+  such a block must not be handed out; detect it by comparing the span width
+  with the block size and retry. MariaDB-side callers cannot cause this: they
+  are serialized on the share's autoinc_refill_mutex.
+*/
+static ulonglong reserve_autoinc_block(THD *thd, const char *db_name,
+                                       const char *table_name, ulonglong want)
+{
+  /*
+    The qualified sequence name is a quoted identifier nested inside a
+    single-quoted string literal argument to nextval(). Escape the inner
+    identifiers (doubling ") and then escape the result for the enclosing
+    literal (doubling ') so a crafted schema/table name cannot inject SQL
+    (MDEV-40653).
+  */
+  std::string qualified=
+      quote_duckdb_identifier(std::string(db_name)) + "." +
+      quote_duckdb_identifier(autoinc_sequence_name(table_name));
+  std::string escaped;
+  escaped.reserve(qualified.size());
+  for (char c : qualified)
+  {
+    if (c == '\'')
+      escaped.push_back('\'');
+    escaped.push_back(c);
+  }
+  std::string query=
+      "SELECT min(x), max(x) FROM (SELECT nextval('" + escaped +
+      "') AS x FROM range(" + std::to_string(want) + ")) t";
+
+  auto *ctx= get_duckdb_context(thd);
+  for (int attempt= 0; attempt < 3; attempt++)
+  {
+    auto result= myduck::duckdb_query(ctx->get_connection(), query);
+    if (result == nullptr || result->HasError())
+      return 0;
+    auto chunk= result->Fetch();
+    if (chunk == nullptr || chunk->size() == 0)
+      return 0;
+    int64_t lo= chunk->GetValue(0, 0).GetValue<int64_t>();
+    int64_t hi= chunk->GetValue(1, 0).GetValue<int64_t>();
+    if ((ulonglong) (hi - lo) + 1 == want)
+      return (ulonglong) lo;
+  }
+  return 0;
+}
+
+void ha_duckdb::get_auto_increment(ulonglong offset, ulonglong increment,
+                                   ulonglong nb_desired_values,
+                                   ulonglong *first_value,
+                                   ulonglong *nb_reserved_values)
+{
+  DBUG_ENTER("ha_duckdb::get_auto_increment");
+
+  /*
+    The server rounds the first value up to the offset/increment grid
+    (handler.cc:4389: at most first + increment - 1) and then steps
+    `increment` at a time, so it uses ids <= first + nb_desired * increment
+    - 1. Consume exactly that many from the cache to keep the server inside
+    our block while leaving no unused ids behind.
+  */
+  ulonglong need= nb_desired_values * increment;
+  if (need / increment != nb_desired_values) /* multiplication overflow */
+  {
+    *first_value= ULONGLONG_MAX;
+    *nb_reserved_values= 0;
+    DBUG_VOID_RETURN;
+  }
+
+  Duckdb_share::Autoinc_range cur= share->autoinc_range.load();
+  for (;;)
+  {
+    /* Fast path: claim [cur.next, cur.next + need) with one CAS. */
+    while (cur.end - cur.next >= need)
+    {
+      Duckdb_share::Autoinc_range claimed= {cur.next + need, cur.end};
+      if (share->autoinc_range.compare_exchange_weak(cur, claimed))
+      {
+        *first_value= cur.next;
+        *nb_reserved_values= nb_desired_values;
+        DBUG_VOID_RETURN;
+      }
+      /* CAS failure reloaded cur. */
+    }
+
+    mysql_mutex_lock(&share->autoinc_refill_mutex);
+    cur= share->autoinc_range.load();
+    if (cur.end - cur.next >= need)
+    {
+      /* Someone refilled while we waited; back to the fast path. */
+      mysql_mutex_unlock(&share->autoinc_refill_mutex);
+      continue;
+    }
+
+    ulonglong want= std::max(need, autoinc_cache_size);
+    DatabaseTableNames dt(table->s->normalized_path.str);
+    ulonglong first= reserve_autoinc_block(ha_thd(), dt.db_name.c_str(),
+                                           dt.table_name.c_str(), want);
+    if (first == 0)
+    {
+      mysql_mutex_unlock(&share->autoinc_refill_mutex);
+      /* The only failure signal the server understands. */
+      *first_value= ULONGLONG_MAX;
+      *nb_reserved_values= 0;
+      DBUG_VOID_RETURN;
+    }
+    /*
+      Publish the new block minus our own share. A plain store cannot clash
+      with concurrent fast-path claims: those still come from the old range,
+      which lies entirely below `first` because the sequence is monotonic.
+      The remainder of the old block is dropped, not merged: ids between the
+      two blocks may already belong to a DuckDB-side writer. The unused ids
+      become gaps, which AUTO_INCREMENT permits.
+    */
+    share->autoinc_range.store({first + need, first + want});
+    mysql_mutex_unlock(&share->autoinc_refill_mutex);
+
+    *first_value= first;
+    *nb_reserved_values= nb_desired_values;
+    DBUG_VOID_RETURN;
+  }
+}
+
+int ha_duckdb::update_row(const uchar *old_row, const uchar *new_row)
+{
+  DBUG_ENTER("ha_duckdb::update_row");
+  int ret= 0;
+  THD *thd= ha_thd();
+
+  /*
+    The batch path writes the whole record[0] as the new row version, so
+    a replicated UPDATE needs a complete after-image. Rows_log_event::
+    do_apply_event() narrows write_set to the after-image columns; with a
+    MINIMAL or NOBLOB master the missing columns would silently get
+    defaults. Reject such events instead.
+  */
+  if (myduck::thd_is_row_injection(thd) &&
+      !bitmap_is_set_all(table->write_set))
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_DML_ERROR,
+             "Replicated UPDATE lacks columns in the after-image; "
+             "DuckDB tables require binlog_row_image=FULL on the master",
+             "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_DML_ERROR);
+  }
+
+  ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  myduck::BatchState batch_state;
+  ret= get_batch_state(thd, false, &batch_state);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  if (batch_state == myduck::BatchState::NOT_IN_BATCH)
+  {
+    if (update_modified_column_only &&
+        calc_row_difference(old_row, new_row, table))
+    {
+      bitmap_copy(table->write_set, &table->tmp_set);
+    }
+    bitmap_clear_all(&table->tmp_set);
+
+    UpdateConvertor update_convertor(table, old_row);
+    ret= execute_dml(thd, &update_convertor);
+    if (ret == 0)
+      srv_duckdb_status.duckdb_rows_update++;
+  }
+  else
+  {
+    auto *ctx= get_duckdb_context(thd);
+    ret= ctx->append_row_update(table, old_row);
+    if (ret == 0)
+      srv_duckdb_status.duckdb_rows_update_in_batch++;
+    else
+    {
+      ctx->set_batch_state(myduck::BatchState::NOT_IN_BATCH);
+      UpdateConvertor update_convertor(table, old_row);
+      ret= execute_dml(thd, &update_convertor);
+      if (ret == 0)
+        srv_duckdb_status.duckdb_rows_update++;
+    }
+  }
+
+  DBUG_RETURN(ret);
+}
+
+int ha_duckdb::delete_row(const uchar *)
+{
+  DBUG_ENTER("ha_duckdb::delete_row");
+  int ret= 0;
+  THD *thd= ha_thd();
+
+  ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  myduck::BatchState batch_state;
+  ret= get_batch_state(thd, false, &batch_state);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  if (batch_state == myduck::BatchState::NOT_IN_BATCH)
+  {
+    DeleteConvertor convertor(table);
+    ret= execute_dml(thd, &convertor);
+    if (ret == 0)
+      srv_duckdb_status.duckdb_rows_delete++;
+  }
+  else
+  {
+    auto *ctx= get_duckdb_context(thd);
+    ret= ctx->append_row_delete(table);
+    if (ret == 0)
+      srv_duckdb_status.duckdb_rows_delete_in_batch++;
+    else
+    {
+      ctx->set_batch_state(myduck::BatchState::NOT_IN_BATCH);
+      DeleteConvertor convertor(table);
+      ret= execute_dml(thd, &convertor);
+      if (ret == 0)
+        srv_duckdb_status.duckdb_rows_delete++;
+    }
+  }
+
+  DBUG_RETURN(ret);
+}
+
+/* ----- Index stubs (not supported) ----- */
+
+int ha_duckdb::index_read_map(uchar *, const uchar *, key_part_map,
+                              enum ha_rkey_function)
+{
+  DBUG_ENTER("ha_duckdb::index_read_map");
+  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+}
+
+int ha_duckdb::index_next(uchar *)
+{
+  DBUG_ENTER("ha_duckdb::index_next");
+  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+}
+
+int ha_duckdb::index_prev(uchar *)
+{
+  DBUG_ENTER("ha_duckdb::index_prev");
+  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+}
+
+int ha_duckdb::index_first(uchar *)
+{
+  DBUG_ENTER("ha_duckdb::index_first");
+  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+}
+
+int ha_duckdb::index_last(uchar *)
+{
+  DBUG_ENTER("ha_duckdb::index_last");
+  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+}
+
+/* ----- Table scan (rnd_*) ----- */
+
+int ha_duckdb::rnd_init(bool)
+{
+  DBUG_ENTER("ha_duckdb::rnd_init");
+  THD *thd= ha_thd();
+  std::string schema_name;
+  std::string table_name;
+
+  if (table && table->s)
+  {
+    schema_name.assign(table->s->db.str, table->s->db.length);
+    table_name.assign(table->s->table_name.str, table->s->table_name.length);
+  }
+  else
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+
+  auto *ctx= get_duckdb_context(thd);
+  std::string error_msg;
+  if (ctx->flush_appenders(error_msg))
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_APPEND_ERROR,
+             error_msg.c_str(), "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_APPEND_ERROR);
+  }
+
+  std::string query= "SELECT * FROM " + quote_duckdb_identifier(schema_name) +
+                     "." + quote_duckdb_identifier(table_name);
+  query_result= myduck::duckdb_query(ctx->get_connection(), query);
+  if (query_result->HasError())
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_ERR_INTERNAL_ERROR, query_result->GetError().c_str(), "DuckDB");
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  }
+
+  current_chunk.reset();
+  current_row_index= 0;
+
+  for (auto *field= table->field; *field; ++field)
+    bitmap_set_bit(table->write_set, (*field)->field_index);
+
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::rnd_end()
+{
+  DBUG_ENTER("ha_duckdb::rnd_end");
+  query_result.reset();
+  current_chunk.reset();
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::rnd_next(uchar *buf)
+{
+  DBUG_ENTER("ha_duckdb::rnd_next");
+  THD *thd= ha_thd();
+
+  if (!query_result)
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+
+  memset(buf, 0, table->s->reclength);
+
+  /* fetch new chunk when current chunk is empty */
+  if (!current_chunk || current_row_index >= current_chunk->size())
+  {
+    current_chunk.reset();
+    current_chunk= query_result->Fetch();
+
+    if (!current_chunk)
+    {
+      if (query_result->HasError())
+      {
+        my_error(ER_GET_ERRMSG, MYF(0), HA_ERR_INTERNAL_ERROR,
+                 query_result->GetError().c_str(), "DuckDB");
+        DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+      }
+      DBUG_RETURN(HA_ERR_END_OF_FILE);
+    }
+    current_row_index= 0;
+  }
+
+  /* store the fields of a tuple */
+  for (size_t col_idx= 0; col_idx < current_chunk->ColumnCount(); ++col_idx)
+  {
+    duckdb::Value value= current_chunk->GetValue(col_idx, current_row_index);
+    Field *field= table->field[col_idx];
+    store_duckdb_field_in_mysql_format(field, value, thd);
+  }
+
+  /* update NULL field tag */
+  if (table->s->null_bytes > 0)
+  {
+    if (table->null_flags)
+      memcpy(buf, table->null_flags, table->s->null_bytes);
+    else
+      memset(buf, 0, table->s->null_bytes);
+  }
+
+  current_row_index++;
+  DBUG_RETURN(0);
+}
+
+void ha_duckdb::position(const uchar *)
+{
+  DBUG_ENTER("ha_duckdb::position");
+  DBUG_VOID_RETURN;
+}
+
+int ha_duckdb::rnd_pos(uchar *, uchar *)
+{
+  DBUG_ENTER("ha_duckdb::rnd_pos");
+  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+}
+
+/*
+  Read-free replication apply. Rows_log_event::find_row() unpacks the
+  event's before-image into record[0] before locating the row; with
+  HA_PRIMARY_KEY_REQUIRED_FOR_POSITION it locates it through this
+  method. DuckDB identifies rows by primary key taken from the record
+  itself, so no lookup is needed: report success and leave the
+  before-image in record[0].
+
+  Any caller outside of the replication applier (filesort, multi-table
+  UPDATE/DELETE) must keep getting an error: faking success there would
+  silently corrupt data.
+*/
+int ha_duckdb::rnd_pos_by_record(uchar *)
+{
+  DBUG_ENTER("ha_duckdb::rnd_pos_by_record");
+  if (!myduck::thd_is_replication_applier(ha_thd()))
+    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::info(uint flag)
+{
+  DBUG_ENTER("ha_duckdb::info");
+  if (flag & HA_STATUS_VARIABLE)
+  {
+    /* Retrieve variable info, such as row counts and file lengths */
+    stats.records= records();
+    stats.deleted= 0;
+    // stats.data_file_length =
+    // stats.index_file_length =
+    // stats.delete_length =
+    stats.check_time= 0;
+    // stats.mrr_length_per_rec =
+
+    // stats.data_file_length may be unset for TIAMAT; avoid division by
+    // garbage.
+    if (stats.records == 0 || stats.data_file_length == 0)
+      stats.mean_rec_length= 0;
+    else
+      stats.mean_rec_length= (ulong) (stats.data_file_length / stats.records);
+  }
+
+  DBUG_RETURN(0);
+}
+
+ha_rows ha_duckdb::records()
+{
+  DBUG_ENTER("ha_tiamat::records");
+  // Optimizer may call records()/info() in contexts where ha_share isn't
+  // initialized for this handler instance. Return a conservative estimate.
+  if (stats.records)
+    DBUG_RETURN(stats.records);
+  DBUG_RETURN(10);
+}
+
+int ha_duckdb::extra(enum ha_extra_function operation)
+{
+  DBUG_ENTER("ha_duckdb::extra");
+  THD *thd= ha_thd();
+  auto *ctx= get_duckdb_context(thd);
+
+  switch (operation)
+  {
+  case HA_EXTRA_BEGIN_COPY:
+    ctx->set_in_copy_ddl(true);
+    break;
+  case HA_EXTRA_END_COPY:
+  case HA_EXTRA_ABORT_COPY:
+    ctx->set_in_copy_ddl(false);
+    break;
+  default:
+    break;
+  }
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::delete_all_rows()
+{
+  DBUG_ENTER("ha_duckdb::delete_all_rows");
+  int ret= 0;
+  THD *thd= ha_thd();
+
+  ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  auto *ctx= get_duckdb_context(thd);
+
+  /* Discard any pending batch rows for this table */
+  DatabaseTableNames dt(table->s->normalized_path.str);
+  ctx->delete_appender(dt.db_name, dt.table_name);
+
+  /* Execute DELETE FROM "schema"."table" */
+  std::string query= "DELETE FROM " + quote_duckdb_identifier(dt.db_name) +
+                     "." + quote_duckdb_identifier(dt.table_name);
+
+  auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
+  if (query_result->HasError())
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_DML_ERROR, query_result->GetError().c_str(), "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_DML_ERROR);
+  }
+
+  DBUG_RETURN(0);
+}
+
+const COND *ha_duckdb::cond_push(const COND *)
+{
+  DBUG_ENTER("ha_duckdb::cond_push");
+  DBUG_RETURN(NULL);
+}
+
+int ha_duckdb::direct_delete_rows_init()
+{
+  DBUG_ENTER("ha_duckdb::direct_delete_rows_init");
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::direct_delete_rows(ha_rows *delete_rows)
+{
+  DBUG_ENTER("ha_duckdb::direct_delete_rows");
+  int ret= 0;
+  THD *thd= ha_thd();
+  LEX_STRING *source_query= thd_query_string(thd);
+  if (myduck::mariadb_query_has_lexical_mismatch(
+          thd, source_query->str, source_query->length))
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_DML_ERROR,
+             "Unsafe MariaDB lexical mismatch in forwarded SQL",
+             "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_DML_ERROR);
+  }
+
+  ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  auto *ctx= get_duckdb_context(thd);
+
+  /* Flush any pending batch rows so DuckDB sees consistent data */
+  std::string error_msg;
+  if (ctx->flush_appenders(error_msg))
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_APPEND_ERROR, error_msg.c_str(), "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_DML_ERROR);
+  }
+
+  /* Execute the original DELETE statement in DuckDB */
+  LEX_STRING *qs= thd_query_string(thd);
+  std::string query(qs->str, qs->length);
+  auto result= myduck::duckdb_query(thd, query, true);
+  if (result->HasError())
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_DML_ERROR, result->GetError().c_str(), "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_DML_ERROR);
+  }
+
+  /* DuckDB returns a single row with the count of affected rows */
+  auto chunk= result->Fetch();
+  if (chunk && chunk->size() > 0)
+    *delete_rows= chunk->GetValue(0, 0).GetValue<int64_t>();
+  else
+    *delete_rows= 0;
+
+  srv_duckdb_status.duckdb_rows_delete+= *delete_rows;
+
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::direct_update_rows_init(List<Item> *update_fields
+                                       __attribute__((unused)))
+{
+  DBUG_ENTER("ha_duckdb::direct_update_rows_init");
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::direct_update_rows(ha_rows *update_rows, ha_rows *found_rows)
+{
+  DBUG_ENTER("ha_duckdb::direct_update_rows");
+  int ret= 0;
+  THD *thd= ha_thd();
+  LEX_STRING *source_query= thd_query_string(thd);
+  if (myduck::mariadb_query_has_lexical_mismatch(
+          thd, source_query->str, source_query->length))
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_DML_ERROR,
+             "Unsafe MariaDB lexical mismatch in forwarded SQL",
+             "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_DML_ERROR);
+  }
+
+  ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  auto *ctx= get_duckdb_context(thd);
+
+  /* Flush any pending batch rows so DuckDB sees consistent data */
+  std::string error_msg;
+  if (ctx->flush_appenders(error_msg))
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_APPEND_ERROR, error_msg.c_str(), "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_DML_ERROR);
+  }
+
+  /* Execute the original UPDATE statement in DuckDB */
+  LEX_STRING *qs= thd_query_string(thd);
+  std::string query(qs->str, qs->length);
+  auto result= myduck::duckdb_query(thd, query, true);
+  if (result->HasError())
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_DML_ERROR, result->GetError().c_str(), "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_DML_ERROR);
+  }
+
+  /* DuckDB returns a single row with the count of affected rows */
+  auto chunk= result->Fetch();
+  ha_rows affected= 0;
+  if (chunk && chunk->size() > 0)
+    affected= chunk->GetValue(0, 0).GetValue<int64_t>();
+
+  *update_rows= affected;
+  *found_rows= affected;
+
+  srv_duckdb_status.duckdb_rows_update+= affected;
+
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::external_lock(THD *thd, int lock_type)
+{
+  DBUG_ENTER("ha_duckdb::external_lock");
+  if (lock_type != F_UNLCK)
+  {
+    /* DuckDB has no row locks: reject SELECT ... FOR UPDATE / LOCK IN SHARE MODE. */
+    if (thd_sql_command(thd) == SQLCOM_SELECT &&
+        (table->reginfo.lock_type == TL_READ_WITH_SHARED_LOCKS ||
+         table->reginfo.lock_type >= TL_FIRST_WRITE))
+    {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0), "locking SELECT");
+      DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+    }
+
+    /* DuckDB does not support XA transactions. Reject DML early. */
+    if (myduck::reject_xa_if_active(thd))
+      DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+
+    int ret= duckdb_register_trx(thd);
+    if (ret)
+      DBUG_RETURN(ret);
+  }
+  DBUG_RETURN(0);
+}
+
+uint ha_duckdb::lock_count(void) const { return 0; }
+
+THR_LOCK_DATA **ha_duckdb::store_lock(THD *, THR_LOCK_DATA **to,
+                                      enum thr_lock_type)
+{
+  return to;
+}
+
+ha_rows ha_duckdb::records_in_range(uint, const key_range *, const key_range *,
+                                    page_range *)
+{
+  DBUG_ENTER("ha_duckdb::records_in_range");
+  DBUG_RETURN(10);
+}
+
+/* ----- DDL operations ----- */
+
+int ha_duckdb::create(const char *name, TABLE *form,
+                      HA_CREATE_INFO *create_info)
+{
+  DBUG_ENTER("ha_duckdb::create");
+  THD *thd= ha_thd();
+
+  int ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  DatabaseTableNames dt(name);
+  CreateTableConvertor convertor(thd, form, create_info, dt.db_name,
+                                 dt.table_name);
+
+  if (convertor.check())
+    DBUG_RETURN(HA_DUCKDB_CREATE_ERROR);
+
+  std::string query= convertor.translate();
+
+  auto *ctx= get_duckdb_context(thd);
+  auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
+
+  if (query_result->HasError())
+  {
+    push_duckdb_query_error(query_result->GetError());
+    DBUG_RETURN(HA_DUCKDB_CREATE_ERROR);
+  }
+
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::delete_table(const char *name)
+{
+  DBUG_ENTER("ha_duckdb::delete_table");
+  THD *thd= ha_thd();
+
+  int ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  DatabaseTableNames dt(name);
+
+  std::string query= "DROP TABLE IF EXISTS " +
+                     quote_duckdb_identifier(dt.db_name) + "." +
+                     quote_duckdb_identifier(dt.table_name);
+
+  auto *ctx= get_duckdb_context(thd);
+  auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
+
+  if (query_result == nullptr || query_result->HasError())
+    DBUG_RETURN(HA_DUCKDB_DROP_TABLE_ERROR);
+
+  /*
+    Drop the AUTO_INCREMENT sequence, if any. It must go after the table:
+    while the column default exists the catalog dependency blocks the drop.
+    The name is derived from the table alone, so no lookup is needed and
+    the statement is harmless for tables without AUTO_INCREMENT.
+  */
+  std::string seq_query= "DROP SEQUENCE IF EXISTS " +
+                         quote_duckdb_identifier(dt.db_name) + "." +
+                         quote_duckdb_identifier(
+                             autoinc_sequence_name(dt.table_name));
+  auto seq_result= myduck::duckdb_query(ctx->get_connection(), seq_query);
+
+  if (seq_result == nullptr || seq_result->HasError())
+    DBUG_RETURN(HA_DUCKDB_DROP_TABLE_ERROR);
+
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::rename_table(const char *from, const char *to)
+{
+  DBUG_ENTER("ha_duckdb::rename_table");
+  THD *thd= ha_thd();
+
+  int ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  DatabaseTableNames old_t(from);
+  DatabaseTableNames new_t(to);
+
+  auto convertor= std::make_unique<RenameTableConvertor>(
+      old_t.db_name, old_t.table_name, new_t.db_name, new_t.table_name);
+
+  if (convertor->check())
+    DBUG_RETURN(HA_DUCKDB_RENAME_ERROR);
+
+  std::string query= convertor->translate();
+
+  auto *ctx= get_duckdb_context(thd);
+  std::string error_msg;
+  ret= ctx->flush_appenders(error_msg);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  auto query_result= myduck::duckdb_query(ctx->get_connection(), query);
+
+  if (query_result->HasError())
+    DBUG_RETURN(HA_DUCKDB_RENAME_ERROR);
+
+  DBUG_RETURN(0);
+}
+
+int ha_duckdb::truncate()
+{
+  DBUG_ENTER("ha_duckdb::truncate");
+  THD *thd= ha_thd();
+
+  int ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(ret);
+
+  std::string schema_name(table->s->db.str, table->s->db.length);
+  std::string table_name(table->s->table_name.str,
+                         table->s->table_name.length);
+
+  std::ostringstream query;
+  query << "USE " << quote_duckdb_identifier(schema_name) << ";";
+  query << "TRUNCATE TABLE " << quote_duckdb_identifier(table_name) << ";";
+
+  auto *ctx= get_duckdb_context(thd);
+  auto query_result= myduck::duckdb_query(ctx->get_connection(), query.str());
+
+  if (query_result->HasError())
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_DUCKDB_TRUNCATE_TABLE_ERROR, query_result->GetError().c_str(), "DuckDB");
+    DBUG_RETURN(HA_DUCKDB_TRUNCATE_TABLE_ERROR);
+  }
+
+  DBUG_RETURN(0);
+}
+
+/* ----- ALTER TABLE (inplace) ----- */
+
+static inline bool database_changed(const char *old_schema,
+                                    const char *new_schema)
+{
+  return strcasecmp(old_schema, new_schema) != 0;
+}
+
+enum_alter_inplace_result
+ha_duckdb::check_if_supported_inplace_alter(TABLE *altered_table,
+                                            Alter_inplace_info *ha_alter_info)
+{
+  DBUG_ENTER("ha_duckdb::check_if_supported_inplace_alter");
+
+  if (database_changed(table->s->db.str, altered_table->s->db.str))
+    DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
+
+  if (ha_alter_info->alter_info->flags & ALTER_COLUMN_ORDER)
+    DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
+
+  if (ha_alter_info->error_if_not_empty)
+    DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
+
+  /* Reject ALTER on tables without PK when require_primary_key is ON */
+  if (myduck::require_primary_key && table->s->primary_key == MAX_KEY)
+  {
+    my_error(ER_REQUIRES_PRIMARY_KEY, MYF(0));
+    DBUG_RETURN(HA_ALTER_ERROR);
+  }
+
+  DBUG_RETURN(HA_ALTER_INPLACE_NO_LOCK);
+}
+
+bool ha_duckdb::commit_inplace_alter_table(TABLE *altered_table,
+                                           Alter_inplace_info *ha_alter_info,
+                                           bool commit)
+{
+  DBUG_ENTER("ha_duckdb::commit_inplace_alter_table");
+
+  if (!commit)
+    DBUG_RETURN(false);
+
+  THD *thd= ha_thd();
+  int ret= duckdb_register_trx(thd);
+  if (ret)
+    DBUG_RETURN(true);
+
+  ulonglong handler_flags= ha_alter_info->handler_flags;
+  ulonglong sql_flags= ha_alter_info->alter_info->flags;
+
+  using DDL_convertor= std::unique_ptr<AlterTableConvertor>;
+  using DDL_convertors= std::vector<DDL_convertor>;
+  DDL_convertor convertor;
+  DDL_convertors convertors;
+
+  std::string schema_name(table->s->db.str, table->s->db.length);
+  std::string table_name(table->s->table_name.str,
+                         table->s->table_name.length);
+
+  if (handler_flags & ALTER_ADD_COLUMN)
+  {
+    convertor= std::make_unique<AddColumnConvertor>(
+        schema_name, table_name, altered_table, ha_alter_info->alter_info);
+    convertors.push_back(std::move(convertor));
+  }
+
+  if (handler_flags & ALTER_DROP_COLUMN)
+  {
+    convertor= std::make_unique<DropColumnConvertor>(
+        schema_name, table_name, table, altered_table,
+        ha_alter_info->alter_info);
+    convertors.push_back(std::move(convertor));
+  }
+
+  if ((sql_flags & ALTER_CHANGE_COLUMN) || (handler_flags & ALTER_COLUMN_NAME))
+  {
+    convertor= std::make_unique<ChangeColumnConvertor>(
+        schema_name, table_name, altered_table, ha_alter_info->alter_info);
+    convertors.push_back(std::move(convertor));
+  }
+
+  if (sql_flags & ALTER_CHANGE_COLUMN_DEFAULT)
+  {
+    convertor= std::make_unique<ChangeColumnDefaultConvertor>(
+        schema_name, table_name, table, altered_table);
+    convertors.push_back(std::move(convertor));
+  }
+
+  /*
+    When adding a primary key, set NOT NULL on the corresponding columns
+    in DuckDB (DuckDB doesn't have indexes, but needs the constraint).
+  */
+  if (sql_flags & ALTER_ADD_INDEX)
+  {
+    convertor= std::make_unique<ChangeColumnForPrimaryKeyConvertor>(
+        schema_name, table_name, altered_table);
+    convertors.push_back(std::move(convertor));
+  }
+
+  if (convertors.empty())
+    DBUG_RETURN(false);
+
+  std::vector<std::string> statements;
+  for (auto &conv : convertors)
+  {
+    if (!conv || conv->check())
+      DBUG_RETURN(true);
+
+    std::string sql= conv->translate();
+    if (!sql.empty())
+      statements.push_back(std::move(sql));
+  }
+
+  if (statements.empty())
+    DBUG_RETURN(false);
+
+  /* A single MariaDB ALTER TABLE can produce multiple DuckDB statements.
+     Execute the generated operations atomically on a dedicated connection. */
+  auto con= myduck::DuckdbManager::CreateConnection();
+  auto query_result= myduck::duckdb_query(*con, "BEGIN");
+  if (query_result->HasError())
+  {
+    my_error(ER_GET_ERRMSG, MYF(0), HA_ERR_GENERIC,
+             query_result->GetError().c_str(), "DuckDB");
+    DBUG_RETURN(true);
+  }
+
+  for (const auto &sql : statements)
+  {
+    query_result= myduck::duckdb_query(*con, sql);
+    if (query_result->HasError())
+    {
+      std::string error= query_result->GetError();
+      myduck::duckdb_query(*con, "ROLLBACK");
+      my_error(ER_GET_ERRMSG, MYF(0), HA_ERR_GENERIC, error.c_str(), "DuckDB");
+      DBUG_RETURN(true);
+    }
+  }
+
+  query_result= myduck::duckdb_query(*con, "COMMIT");
+  if (query_result->HasError())
+  {
+    std::string error= query_result->GetError();
+    if (con->HasActiveTransaction())
+      myduck::duckdb_query(*con, "ROLLBACK");
+    my_error(ER_GET_ERRMSG, MYF(0), HA_ERR_GENERIC, error.c_str(), "DuckDB");
+    DBUG_RETURN(true);
+  }
+
+  DBUG_RETURN(false);
+}
+
+/* ----- Plugin declaration ----- */
+
+my_bool allow_run_in_duckdb= FALSE;
+
+/* ---- global variables (no DuckDB push) ---- */
+
+static MYSQL_SYSVAR_BOOL(allow_run_in_duckdb, allow_run_in_duckdb,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Allow execution of run_in_duckdb() function "
+                         "(requires SUPER privilege)",
+                         NULL, NULL, FALSE);
+
+my_bool allow_duckdb_file_io= FALSE;
+char *duckdb_remote_url_prefixes= NULL;
+
+static MYSQL_SYSVAR_BOOL(allow_file_io, allow_duckdb_file_io,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Allow the duckdb_load_*, duckdb_export_* and "
+                         "duckdb_export_database() functions to access "
+                         "files (also requires the FILE privilege)",
+                         NULL, NULL, FALSE);
+
+static MYSQL_SYSVAR_STR(remote_url_prefixes, duckdb_remote_url_prefixes,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+                        "Comma-separated list of https://, http:// or s3:// "
+                        "URL prefixes the duckdb_load_* functions may read "
+                        "from. Empty (the default) disables remote reads",
+                        NULL, NULL, "");
+
+/* ---- Quack (MDEV-41383, see Quack.MD) ---- */
+
+my_bool quack_enabled= FALSE;
+static MYSQL_SYSVAR_BOOL(quack_enabled, quack_enabled,
+                         PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                         "Serve DuckDB tables over the Quack protocol, with "
+                         "MariaDB accounts and grants (TLS only)",
+                         NULL, NULL, FALSE);
+char *quack_bind_address= NULL;
+static MYSQL_SYSVAR_STR(quack_bind_address, quack_bind_address,
+                        PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                        "Comma-separated addresses the Quack listener binds "
+                        "(one socket each)",
+                        NULL, NULL, "127.0.0.1");
+uint quack_port= 0;
+static MYSQL_SYSVAR_UINT(quack_port, quack_port,
+                         PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                         "Quack listener port (0: any free port, see "
+                         "Duckdb_quack_endpoints)",
+                         NULL, NULL, 0, 0, 65535, 0);
+char *quack_ssl_cert= NULL;
+static MYSQL_SYSVAR_STR(quack_ssl_cert, quack_ssl_cert,
+                        PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                        "PEM certificate of the Quack listener (required)",
+                        NULL, NULL, NULL);
+char *quack_ssl_key= NULL;
+static MYSQL_SYSVAR_STR(quack_ssl_key, quack_ssl_key,
+                        PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                        "PEM private key of the Quack listener (required, "
+                        "unencrypted)",
+                        NULL, NULL, NULL);
+uint quack_max_connections= 64;
+static MYSQL_SYSVAR_UINT(quack_max_connections, quack_max_connections,
+                         PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                         "Concurrent Quack client connections; more are "
+                         "refused",
+                         NULL, NULL, 64, 1, 65536, 0);
+uint quack_max_sessions= 256;
+static MYSQL_SYSVAR_UINT(quack_max_sessions, quack_max_sessions,
+                         PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                         "Open Quack sessions; more logins are refused",
+                         NULL, NULL, 256, 1, 1048576, 0);
+uint quack_max_transaction_seconds= 300;
+static MYSQL_SYSVAR_UINT(quack_max_transaction_seconds,
+                         quack_max_transaction_seconds,
+                         PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                         "A Quack session whose transaction stays open "
+                         "longer is closed",
+                         NULL, NULL, 300, 1, 604800, 0);
+uint quack_max_heartbeat_seconds= 300;
+static MYSQL_SYSVAR_UINT(quack_max_heartbeat_seconds,
+                         quack_max_heartbeat_seconds,
+                         PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                         "Longest heartbeat lease a Quack client may ask for",
+                         NULL, NULL, 300, 1, 604800, 0);
+
+my_bool quack_bridge_test= FALSE;
+static MYSQL_SYSVAR_BOOL(quack_bridge_test, quack_bridge_test,
+                         PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                         "Enable QUACK_BRIDGE_TEST(), which checks MariaDB "
+                         "grants through the Quack bridge (for tests; "
+                         "requires SUPER)",
+                         NULL, NULL, FALSE);
+
+ulong quack_acl_queue_size= 64;
+static void update_quack_acl_queue_size(THD *, struct st_mysql_sys_var *,
+                                        void *var, const void *save)
+{
+  *(ulong *) var= *(const ulong *) save;
+  quack_bridge::acl_queue_size= *(const ulong *) save;
+}
+static MYSQL_SYSVAR_ULONG(quack_acl_queue_size, quack_acl_queue_size,
+                          PLUGIN_VAR_RQCMDARG,
+                          "Quack authorization requests that may wait for "
+                          "the ACL worker; more are denied (0 denies all)",
+                          NULL, update_quack_acl_queue_size, 64, 0, 65536, 0);
+
+ulong quack_acl_timeout_ms= 5000;
+static void update_quack_acl_timeout_ms(THD *, struct st_mysql_sys_var *,
+                                        void *var, const void *save)
+{
+  *(ulong *) var= *(const ulong *) save;
+  quack_bridge::acl_timeout_ms= *(const ulong *) save;
+}
+static MYSQL_SYSVAR_ULONG(quack_acl_timeout_ms, quack_acl_timeout_ms,
+                          PLUGIN_VAR_RQCMDARG,
+                          "How long a Quack authorization request may wait, "
+                          "in milliseconds; longer ones are denied (0 denies "
+                          "all)",
+                          NULL, update_quack_acl_timeout_ms, 5000, 0,
+                          3600000, 0);
+
+static MYSQL_SYSVAR_BOOL(copy_ddl_in_batch, copy_ddl_in_batch,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Use batch insert to speed up copy ddl", NULL, NULL,
+                         TRUE);
+
+static MYSQL_SYSVAR_BOOL(dml_in_batch, dml_in_batch, PLUGIN_VAR_RQCMDARG,
+                         "Use batch to speed up INSERT/UPDATE/DELETE", NULL,
+                         NULL, TRUE);
+
+static MYSQL_SYSVAR_BOOL(update_modified_column_only,
+                         update_modified_column_only, PLUGIN_VAR_RQCMDARG,
+                         "Whether to only update modified columns", NULL, NULL,
+                         TRUE);
+
+static MYSQL_SYSVAR_ULONGLONG(autoinc_cache_size, autoinc_cache_size,
+                              PLUGIN_VAR_RQCMDARG,
+                              "Number of AUTO_INCREMENT ids reserved from the "
+                              "backing DuckDB sequence per query",
+                              NULL, NULL, 1000, 1, 1048576, 0);
+
+/* ---- Global proxy variables (pushed into DuckDB) ---- */
+
+static MYSQL_SYSVAR_ULONGLONG(memory_limit, myduck::global_memory_limit,
+                              PLUGIN_VAR_RQCMDARG,
+                              "DuckDB memory limit in bytes (0 = default)",
+                              NULL, myduck::update_memory_limit_cb, 0, 0,
+                              ULONGLONG_MAX, 0);
+
+static MYSQL_SYSVAR_STR(temp_directory, myduck::global_duckdb_temp_directory,
+                        PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                        "Directory for DuckDB temporary files", NULL, NULL,
+                        NULL);
+
+static MYSQL_SYSVAR_ULONGLONG(max_temp_directory_size,
+                              myduck::global_max_temp_directory_size,
+                              PLUGIN_VAR_RQCMDARG,
+                              "Max disk space for DuckDB temp directory "
+                              "(0 = 90%% of available)",
+                              NULL, myduck::update_max_temp_directory_size_cb,
+                              0, 0, ULONGLONG_MAX, 1024);
+
+static MYSQL_SYSVAR_ULONGLONG(max_threads, myduck::global_max_threads,
+                              PLUGIN_VAR_RQCMDARG,
+                              "DuckDB max threads (0 = default)", NULL,
+                              myduck::update_threads_cb, 0, 0, 1048576, 0);
+
+static MYSQL_SYSVAR_ULONGLONG(async_threads, myduck::global_async_threads,
+                              PLUGIN_VAR_RQCMDARG,
+                              "DuckDB async I/O threads (0 = run I/O tasks "
+                              "synchronously on the query threads)",
+                              NULL, myduck::update_async_threads_cb, 0, 0,
+                              1048576, 0);
+
+static MYSQL_SYSVAR_BOOL(use_direct_io, myduck::global_use_dio,
+                         PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+                         "Use Direct I/O for DuckDB data files", NULL, NULL,
+                         FALSE);
+
+static MYSQL_SYSVAR_BOOL(scheduler_process_partial,
+                         myduck::global_scheduler_process_partial,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Partially process tasks before rescheduling", NULL,
+                         myduck::update_scheduler_process_partial_cb, TRUE);
+
+static MYSQL_SYSVAR_ULONGLONG(checkpoint_threshold,
+                              myduck::checkpoint_threshold,
+                              PLUGIN_VAR_RQCMDARG,
+                              "DuckDB WAL checkpoint threshold in bytes", NULL,
+                              myduck::update_checkpoint_threshold_cb,
+                              268435456, 0, ULONGLONG_MAX, 1024);
+
+static MYSQL_SYSVAR_BOOL(use_double_for_decimal,
+                         myduck::use_double_for_decimal, PLUGIN_VAR_RQCMDARG,
+                         "Use DOUBLE for DECIMAL precision > 38", NULL, NULL,
+                         TRUE);
+
+static MYSQL_SYSVAR_BOOL(require_primary_key, myduck::require_primary_key,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Require primary key for DuckDB tables", NULL, NULL,
+                         TRUE);
+
+static MYSQL_SYSVAR_ULONGLONG(appender_allocator_flush_threshold,
+                              myduck::appender_allocator_flush_threshold,
+                              PLUGIN_VAR_RQCMDARG,
+                              "Flush appender allocator when batch memory "
+                              "reaches this threshold",
+                              NULL, myduck::update_appender_flush_threshold_cb,
+                              67108864, 0, ULONGLONG_MAX, 1024);
+
+static MYSQL_SYSVAR_SET(log_options, myduck::duckdb_log_options,
+                        PLUGIN_VAR_RQCMDARG, "DuckDB operation types to log",
+                        NULL, NULL, 0, &myduck::log_options_typelib);
+
+/* ---- Session variables (propagated per-connection) ---- */
+
+static MYSQL_THDVAR_ULONGLONG(merge_join_threshold, PLUGIN_VAR_RQCMDARG,
+                              "Row count threshold to prefer merge join", NULL,
+                              NULL, 4611686018427387904ULL, 0,
+                              4611686018427387904ULL, 0);
+
+static MYSQL_THDVAR_BOOL(force_no_collation, PLUGIN_VAR_RQCMDARG,
+                         "Disable collation pushdown, use binary comparison",
+                         NULL, NULL, FALSE);
+
+static MYSQL_THDVAR_ENUM(explain_output, PLUGIN_VAR_RQCMDARG,
+                         "DuckDB EXPLAIN output format", NULL, NULL,
+                         myduck::EXPLAIN_PHYSICAL_ONLY,
+                         &myduck::explain_output_typelib);
+
+static MYSQL_THDVAR_SET(disabled_optimizers, PLUGIN_VAR_RQCMDARG,
+                        "Disable specific DuckDB optimizer rules", NULL, NULL,
+                        0, &myduck::disabled_optimizers_typelib);
+
+static MYSQL_THDVAR_BOOL(cross_engine_ryow, PLUGIN_VAR_RQCMDARG,
+                         "In cross-engine joins, read own uncommitted writes "
+                         "from non-DuckDB tables via a direct handler scan in "
+                         "the parent transaction (disables predicate pushdown "
+                         "and index access path for those tables)",
+                         NULL, NULL, FALSE);
+
+/* ---- THDVAR accessor functions (used from duckdb_context.cc) ---- */
+
+namespace myduck
+{
+
+ulonglong get_thd_merge_join_threshold(THD *thd)
+{
+  return THDVAR(thd, merge_join_threshold);
+}
+
+my_bool get_thd_force_no_collation(THD *thd)
+{
+  return THDVAR(thd, force_no_collation);
+}
+
+ulong get_thd_explain_output(THD *thd) { return THDVAR(thd, explain_output); }
+
+ulonglong get_thd_disabled_optimizers(THD *thd)
+{
+  return THDVAR(thd, disabled_optimizers);
+}
+
+my_bool get_thd_cross_engine_ryow(THD *thd)
+{
+  return THDVAR(thd, cross_engine_ryow);
+}
+
+} // namespace myduck
+
+static struct st_mysql_sys_var *duckdb_system_variables[]= {
+    MYSQL_SYSVAR(allow_run_in_duckdb),
+    MYSQL_SYSVAR(allow_file_io), MYSQL_SYSVAR(remote_url_prefixes),
+    MYSQL_SYSVAR(quack_enabled), MYSQL_SYSVAR(quack_bind_address),
+    MYSQL_SYSVAR(quack_port), MYSQL_SYSVAR(quack_ssl_cert),
+    MYSQL_SYSVAR(quack_ssl_key), MYSQL_SYSVAR(quack_max_connections),
+    MYSQL_SYSVAR(quack_max_sessions),
+    MYSQL_SYSVAR(quack_max_transaction_seconds),
+    MYSQL_SYSVAR(quack_max_heartbeat_seconds),
+    MYSQL_SYSVAR(quack_bridge_test), MYSQL_SYSVAR(quack_acl_queue_size),
+    MYSQL_SYSVAR(quack_acl_timeout_ms),
+    MYSQL_SYSVAR(copy_ddl_in_batch), MYSQL_SYSVAR(dml_in_batch),
+    MYSQL_SYSVAR(update_modified_column_only),
+    MYSQL_SYSVAR(autoinc_cache_size),
+    /* Global proxy */
+    MYSQL_SYSVAR(memory_limit), MYSQL_SYSVAR(temp_directory),
+    MYSQL_SYSVAR(max_temp_directory_size), MYSQL_SYSVAR(max_threads),
+    MYSQL_SYSVAR(async_threads),
+    MYSQL_SYSVAR(use_direct_io), MYSQL_SYSVAR(scheduler_process_partial),
+    MYSQL_SYSVAR(checkpoint_threshold), MYSQL_SYSVAR(use_double_for_decimal),
+    MYSQL_SYSVAR(require_primary_key),
+    MYSQL_SYSVAR(appender_allocator_flush_threshold),
+    MYSQL_SYSVAR(log_options),
+    /* Session proxy */
+    MYSQL_SYSVAR(merge_join_threshold), MYSQL_SYSVAR(force_no_collation),
+    MYSQL_SYSVAR(explain_output), MYSQL_SYSVAR(disabled_optimizers),
+    MYSQL_SYSVAR(cross_engine_ryow), NULL};
+
+static int show_duckdb_version(MYSQL_THD, struct st_mysql_show_var *var,
+                               void *, system_status_var *, enum_var_type)
+{
+  var->type= SHOW_CHAR;
+  var->value= const_cast<char *>(duckdb::DuckDB::LibraryVersion());
+  return 0;
+}
+
+static struct st_mysql_show_var duckdb_status_variables[]= {
+    {"Duckdb_version", (char *) show_duckdb_version, SHOW_SIMPLE_FUNC},
+    {"Duckdb_quack", (char *) quack_status_variables, SHOW_ARRAY},
+    {"Duckdb_rows_insert", (char *) &srv_duckdb_status.duckdb_rows_insert,
+     SHOW_LONGLONG},
+    {"Duckdb_rows_update", (char *) &srv_duckdb_status.duckdb_rows_update,
+     SHOW_LONGLONG},
+    {"Duckdb_rows_delete", (char *) &srv_duckdb_status.duckdb_rows_delete,
+     SHOW_LONGLONG},
+    {"Duckdb_rows_insert_in_batch",
+     (char *) &srv_duckdb_status.duckdb_rows_insert_in_batch, SHOW_LONGLONG},
+    {"Duckdb_rows_update_in_batch",
+     (char *) &srv_duckdb_status.duckdb_rows_update_in_batch, SHOW_LONGLONG},
+    {"Duckdb_rows_delete_in_batch",
+     (char *) &srv_duckdb_status.duckdb_rows_delete_in_batch, SHOW_LONGLONG},
+    {"Duckdb_commit", (char *) &srv_duckdb_status.duckdb_commit,
+     SHOW_LONGLONG},
+    {"Duckdb_rollback", (char *) &srv_duckdb_status.duckdb_rollback,
+     SHOW_LONGLONG},
+    {NullS, NullS, SHOW_LONG}};
+
+static struct st_mysql_storage_engine duckdb_storage_engine= {
+    MYSQL_HANDLERTON_INTERFACE_VERSION};
+
+extern Plugin_function plugin_descriptor_function_run_in_duckdb;
+extern Plugin_function plugin_descriptor_function_quack_bridge_test;
+
+/*
+  Wrapper functions from duckdb_udf_wrappers.cc: SQL function (= plugin) name
+  and description.  The table generates both the extern declarations and the
+  plugin descriptors below.
+*/
+#define DUCKDB_WRAPPER_FUNCTIONS(X)                                           \
+  X(duckdb_load_parquet, "DUCKDB_LOAD_PARQUET",                               \
+    "Load a parquet file (local or remote) into a DuckDB table")              \
+  X(duckdb_load_csv, "DUCKDB_LOAD_CSV",                                       \
+    "Load a CSV file into a DuckDB table")                                    \
+  X(duckdb_load_json, "DUCKDB_LOAD_JSON",                                     \
+    "Load a JSON file into a DuckDB table")                                   \
+  X(duckdb_export_parquet, "DUCKDB_EXPORT_PARQUET",                           \
+    "Write a DuckDB table to a local parquet file")                           \
+  X(duckdb_export_csv, "DUCKDB_EXPORT_CSV",                                   \
+    "Write a DuckDB table to a local CSV file")                               \
+  X(duckdb_export_json, "DUCKDB_EXPORT_JSON",                                 \
+    "Write a DuckDB table to a local JSON file")                              \
+  X(duckdb_export_database, "DUCKDB_EXPORT_DATABASE",                         \
+    "Export the whole DuckDB database to a local directory")                  \
+  X(duckdb_checkpoint, "DUCKDB_CHECKPOINT",                                   \
+    "Run CHECKPOINT (FORCE CHECKPOINT with argument 1) and report the "       \
+    "database file size before and after")                                    \
+  X(duckdb_analyze, "DUCKDB_ANALYZE",                                         \
+    "Run ANALYZE on all DuckDB tables or on one table")                       \
+  X(duckdb_file_size, "DUCKDB_FILE_SIZE",                                     \
+    "Return the size in bytes of the DuckDB database file")                   \
+  X(duckdb_setting, "DUCKDB_SETTING",                                         \
+    "Return the value of a DuckDB setting")                                   \
+  X(duckdb_loaded_extensions, "DUCKDB_LOADED_EXTENSIONS",                     \
+    "List the loaded DuckDB extensions")
+
+#define DUCKDB_DECLARE_FN(SYM, NAME, DESC)                                    \
+  extern Plugin_function plugin_descriptor_function_##SYM;
+
+#define DUCKDB_FN_ENTRY(SYM, NAME, DESC)                                      \
+  , {MariaDB_FUNCTION_PLUGIN, &plugin_descriptor_function_##SYM, NAME,        \
+     "MariaDB Foundation", DESC, PLUGIN_LICENSE_GPL, NULL, NULL,             \
+     PLUGIN_HEX_VERSION, NULL, NULL, PLUGIN_VERSION,                          \
+     MariaDB_PLUGIN_MATURITY_GAMMA}
+
+DUCKDB_WRAPPER_FUNCTIONS(DUCKDB_DECLARE_FN)
+
+maria_declare_plugin(duckdb)
+{
+    MYSQL_STORAGE_ENGINE_PLUGIN,
+    &duckdb_storage_engine,
+    "DUCKDB",
+    "drrtuy,lfedorov",
+    "DuckDB storage engine",
+    PLUGIN_LICENSE_GPL,
+    duckdb_init_func,              /* Plugin Init */
+    duckdb_deinit_func,            /* Plugin Deinit */
+    PLUGIN_HEX_VERSION,            /* version number (2.0) */
+    duckdb_status_variables,       /* status variables */
+    duckdb_system_variables,       /* system variables */
+    PLUGIN_VERSION,                /* string version */
+    MariaDB_PLUGIN_MATURITY_GAMMA  /* maturity */
+},
+{
+    MariaDB_FUNCTION_PLUGIN,
+    &plugin_descriptor_function_run_in_duckdb,
+    "RUN_IN_DUCKDB",
+    "drrtuy,lfedorov",
+    "Execute a SQL query in DuckDB and return the result as a string",
+    PLUGIN_LICENSE_GPL,
+    NULL,                          /* Plugin Init */
+    NULL,                          /* Plugin Deinit */
+    PLUGIN_HEX_VERSION,            /* version number (2.0) */
+    NULL,                          /* status variables */
+    NULL,                          /* system variables */
+    PLUGIN_VERSION,                /* string version */
+    MariaDB_PLUGIN_MATURITY_GAMMA  /* maturity */
+},
+{
+    MariaDB_FUNCTION_PLUGIN,
+    &plugin_descriptor_function_quack_bridge_test,
+    "QUACK_BRIDGE_TEST",
+    "drrtuy,lfedorov",
+    "Check MariaDB grants through the Quack bridge (tests only)",
+    PLUGIN_LICENSE_GPL,
+    NULL,                          /* Plugin Init */
+    NULL,                          /* Plugin Deinit */
+    0x0200,                        /* version number (2.0) */
+    NULL,                          /* status variables */
+    NULL,                          /* system variables */
+    "1.0",                         /* string version */
+    MariaDB_PLUGIN_MATURITY_GAMMA  /* maturity */
+}
+DUCKDB_WRAPPER_FUNCTIONS(DUCKDB_FN_ENTRY)
+maria_declare_plugin_end;

@@ -1,0 +1,505 @@
+/*
+  Copyright (c) 2026, MariaDB Foundation.
+  Copyright (c) 2026, Roman Nozdrin <drrtuy@gmail.com>
+  Copyright (c) 2026, Leonid Fedorov.
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; version 2 of the License.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335 USA
+*/
+
+#include "duckdb_manager.h"
+
+#define MYSQL_SERVER 1
+#include <my_global.h>
+#include <unistd.h>
+#include "mysqld.h"
+#include "sys_vars_shared.h"
+#include "log.h"
+#include "duckdb_config.h"
+
+#undef UNKNOWN
+
+#include "cross_engine_scan.h"
+#include "duckdb_mysql_compat.h"
+#include "duckdb_mariadb_tz.h"
+#include "mariadb_dialect.h"
+#include "duckdb/parser/sql_statement.hpp"
+#include "quack_guard/quack_guard.hpp"
+
+/* Defined by the generated duckdb_static_extension_loader.c */
+extern "C" int32_t duckdb_register_static_extensions(void);
+
+namespace myduck
+{
+
+DuckdbManager *DuckdbManager::m_instance= nullptr;
+
+DuckdbManager::DuckdbManager() : m_database(nullptr) {}
+
+namespace
+{
+
+/* Total physical memory of the host, in bytes (0 if it cannot be detected). */
+uint64_t duckdb_physical_memory()
+{
+  long pages= sysconf(_SC_PHYS_PAGES);
+  long page_size= sysconf(_SC_PAGESIZE);
+  if (pages > 0 && page_size > 0)
+    return (uint64_t) pages * (uint64_t) page_size;
+  return 0;
+}
+
+/* Read a global integer system variable by name (0 if not found/NULL). */
+uint64_t read_global_ull_sysvar(const char *name, size_t len)
+{
+  sys_var *var= intern_find_sys_var(name, len);
+  if (!var)
+    return 0;
+  const LEX_CSTRING base= {nullptr, 0};
+  bool is_null= false;
+  longlong v= var->val_int(&is_null, current_thd, OPT_GLOBAL, &base);
+  return (is_null || v < 0) ? 0 : (uint64_t) v;
+}
+
+/*
+  Estimate the memory InnoDB may reserve for its buffer pool.
+  innodb_buffer_pool_size_max is the address space InnoDB pre-reserves for the
+  (dynamically resizable) buffer pool, i.e. the upper bound of its cache
+  memory.  When left at its huge default (~8TB of PROT_NONE mapping, larger
+  than physical RAM) it is not a meaningful budget figure, so fall back to the
+  currently committed innodb_buffer_pool_size in that case.
+*/
+uint64_t innodb_reserved_memory(uint64_t phys_mem)
+{
+  uint64_t bp_max=
+      read_global_ull_sysvar(STRING_WITH_LEN("innodb_buffer_pool_size_max"));
+  if (bp_max == 0 || bp_max >= phys_mem)
+    bp_max=
+        read_global_ull_sysvar(STRING_WITH_LEN("innodb_buffer_pool_size"));
+  return bp_max;
+}
+
+} // anonymous namespace
+
+bool DuckdbManager::Initialize()
+{
+  if (m_database != nullptr)
+    return false;
+
+  std::lock_guard<std::mutex> lock(m_mutex);
+
+  if (m_database != nullptr)
+    return false;
+
+  duckdb::DBConfig config;
+
+  /* Direct I/O is a per-database storage option of the main database. */
+  if (global_use_dio)
+    config.options.main_database_options["io_mode"]=
+        duckdb::Value("DIRECT_IO");
+
+  /*
+    Use the DuckDB v2.0.0 on-disk storage format for newly created databases.
+    Modern column compression schemes are gated behind the storage version;
+    with the conservative default DuckDB falls back to legacy encodings, which
+    makes the database file substantially larger. For a freshly created
+    database StorageManager derives the storage version from this option;
+    an existing database file keeps the version it was created with.
+    Files written in this format cannot be opened by DuckDB v1.x.
+  */
+  config.options.storage_compatibility=
+      duckdb::StorageCompatibility::FromString("v2.0.0");
+
+  if (global_max_threads != 0)
+    config.options.maximum_threads= global_max_threads;
+
+  /*
+    DuckDB v2 starts a separate pool of async I/O threads, by default
+    min(4 * cores, 256) of them. Bound it inside mysqld.
+  */
+  config.options.async_threads= global_async_threads;
+
+  /*
+    When memory_limit sysvar is 0 (default), size DuckDB's memory as 80% of
+    the RAM left after InnoDB's reserved buffer-pool memory:
+
+        memory_limit = 0.8 * (physical_RAM - innodb_buffer_pool_size_max)
+
+    Fall back to an explicit 1 GB if detection is unavailable (e.g. inside
+    some Docker/cgroup environments) or the computed value is too small.
+  */
+  static constexpr uint64_t DUCKDB_DEFAULT_MEMORY_FALLBACK= 1ULL
+                                                            << 30; /* 1 GB */
+  if (global_memory_limit != 0)
+    config.options.maximum_memory= global_memory_limit;
+  else
+  {
+    uint64_t phys_mem= duckdb_physical_memory();
+    uint64_t innodb_mem= innodb_reserved_memory(phys_mem);
+    uint64_t avail= (phys_mem > innodb_mem)
+                        ? (uint64_t) ((phys_mem - innodb_mem) * 0.8)
+                        : 0;
+    config.options.maximum_memory= (avail > DUCKDB_DEFAULT_MEMORY_FALLBACK)
+                                       ? avail
+                                       : DUCKDB_DEFAULT_MEMORY_FALLBACK;
+    sql_print_information(
+        "DuckDB: auto memory_limit=%llu bytes "
+        "(physical RAM=%llu, InnoDB reserved=%llu)",
+        (unsigned long long) config.options.maximum_memory,
+        (unsigned long long) phys_mem, (unsigned long long) innodb_mem);
+  }
+
+  if (global_max_temp_directory_size != 0)
+    config.options.maximum_swap_space= global_max_temp_directory_size;
+
+  config.options.checkpoint_wal_size= checkpoint_threshold;
+
+  /* Temp directory: user-specified or default (data directory) */
+  {
+    char tmp_path[FN_REFLEN];
+    if (global_duckdb_temp_directory && global_duckdb_temp_directory[0])
+      config.options.temporary_directory= global_duckdb_temp_directory;
+    else
+    {
+      fn_format(tmp_path, DUCKDB_DEFAULT_TMP_NAME, mysql_real_data_home, "",
+                MYF(0));
+      config.options.temporary_directory= tmp_path;
+    }
+  }
+
+  /* Store all tables in one file in the data directory */
+  char path[FN_REFLEN];
+  fn_format(path, DUCKDB_FILE_NAME, mysql_real_data_home, "", MYF(0));
+
+  /*
+    Register the statically linked extensions (generated loader, see
+    cmake/duckdb.cmake). DuckDB loads every registered extension when the
+    database is opened. Registration is idempotent.
+  */
+  if (duckdb_register_static_extensions() != 0)
+  {
+    sql_print_error("DuckDB: failed to register statically linked "
+                    "extensions");
+    return true;
+  }
+
+  try
+  {
+    register_mariadb_dialect(config);
+    m_database= new duckdb::DuckDB(path, &config);
+  }
+  catch (const std::exception &e)
+  {
+    sql_print_error("DuckDB: failed to open database at '%s': %s", path,
+                    e.what());
+    m_database= nullptr;
+    return true;
+  }
+  catch (...)
+  {
+    sql_print_error("DuckDB: failed to open database at '%s': "
+                    "unknown exception",
+                    path);
+    m_database= nullptr;
+    return true;
+  }
+
+  try
+  {
+    /* Enable autoloading of statically-linked extensions (core_functions etc.) */
+    auto con= std::make_shared<duckdb::Connection>(*m_database);
+    parse_mariadb_statement(*con, "SELECT 1");
+    auto init_query= [&con](const std::string &sql) {
+      auto result= con->Query(sql);
+      if (!result)
+        throw duckdb::InternalException(
+            "DuckDB initialization query returned no result");
+      if (result->HasError())
+        throw duckdb::InvalidInputException(
+            "DuckDB initialization query failed: %s", result->GetError());
+    };
+    init_query("SET autoload_known_extensions=true");
+    /*
+      All required extensions are linked statically. Never download
+      extension binaries from the network inside mysqld.
+    */
+    init_query("SET autoinstall_known_extensions=false");
+    init_query("SET allow_community_extensions=false");
+    /* MariaDB returns NULL (with a warning) for x DIV 0 and x MOD 0. */
+    init_query("SET GLOBAL error_on_division_by_zero=false");
+
+    /*
+      Register MariaDB-compatible SQL macros for functions that DuckDB
+      lacks but MariaDB pushes down via the original query text.
+    */
+    init_query("CREATE OR REPLACE MACRO adddate(d, i) AS d + i");
+    /* addtime/subtime registered as C++ UDFs */
+    /* curdate/curtime — MariaDB aliases */
+    /* datediff(d1, d2) — MariaDB returns days, DuckDB needs 3-arg form */
+    init_query("CREATE OR REPLACE MACRO datediff(d1, d2) AS "
+               "(d1::DATE - d2::DATE)");
+    init_query("CREATE OR REPLACE MACRO curdate() AS current_date");
+    init_query("CREATE OR REPLACE MACRO curtime(fsp := 0) AS current_time");
+    /* utc_time/utc_timestamp/utc_date — UTC wall-clock; fsp ignored */
+    init_query("CREATE OR REPLACE MACRO utc_timestamp(fsp := 0) AS "
+               "timezone('UTC', now())::TIMESTAMP");
+    init_query("CREATE OR REPLACE MACRO utc_time(fsp := 0) AS "
+               "timezone('UTC', now())::TIME");
+    init_query("CREATE OR REPLACE MACRO utc_date() AS "
+               "timezone('UTC', now())::DATE");
+    /* time_to_sec(t) — seconds since midnight */
+    init_query("CREATE OR REPLACE MACRO time_to_sec(t) AS "
+               "(date_part('hour', t)*3600 + date_part('minute', t)*60 "
+               "+ date_part('second', t))::BIGINT");
+    init_query("CREATE OR REPLACE MACRO subdate(d, i) AS d - i");
+    init_query("CREATE OR REPLACE MACRO insert(str, pos, len, newstr) AS "
+               "CASE WHEN pos < 1 OR pos > length(str) THEN str "
+               "ELSE substr(str, 1, pos - 1) || newstr || "
+               "substr(str, pos + len) END");
+    /* to_base64 / from_base64 — DuckDB uses base64()/from_base64() */
+    init_query("CREATE OR REPLACE MACRO to_base64(x) AS "
+               "base64(encode(x))");
+    /* substring_index(str, delim, count) */
+    init_query("CREATE OR REPLACE MACRO substring_index(s, d, c) AS "
+               "CASE WHEN c > 0 THEN "
+               "array_to_string(list_slice(string_split(s, d), 1, c), d) "
+               "WHEN c < 0 THEN "
+               "array_to_string(list_slice(string_split(s, d), c, NULL), d) "
+               "ELSE '' END");
+    /* strcmp(s1, s2) — returns 0, -1 or 1 */
+    init_query("CREATE OR REPLACE MACRO strcmp(a, b) AS "
+               "CASE WHEN a = b THEN 0 WHEN a < b THEN -1 ELSE 1 END");
+    /* MID() registered as C++ UDF in register_mariadb_compat_functions() */
+    /* oct, bin, hex, locate are now registered as native C++ scalar functions
+       in register_mariadb_compat_functions() -- no SQL macros needed. */
+    /* Register MySQL-compatible function overloads */
+    register_mariadb_compat_functions(*m_database->instance);
+    register_mariadb_time_zone_functions(*m_database->instance);
+    /* unix_timestamp([ts]) — epoch seconds; no arg = now().
+       mariadb_datetime() (duckdb_mysql_compat.cc) turns numbers,
+       strings, TIME and DATE into a naive TIMESTAMP the way MariaDB
+       does; TIMESTAMP columns and now() stay TIMESTAMPTZ.
+       mariadb_unix_timestamp() (duckdb_mariadb_tz.cc) reads a naive
+       TIMESTAMP as wall-clock
+       time in the session TimeZone (set by
+       DuckdbThdContext::config_duckdb_timezone()) with MariaDB's DST
+       rules, and returns NULL outside the TIMESTAMP range.
+       Created after both are registered: macros bind here. */
+    init_query("CREATE OR REPLACE MACRO unix_timestamp(ts := now()) AS "
+               "mariadb_unix_timestamp(mariadb_datetime(ts, current_date))");
+    /* convert_tz(ts, from_tz, to_tz) — MariaDB zone names and DST rules,
+       see mariadb_convert_tz() in duckdb_mariadb_tz.cc */
+    init_query("CREATE OR REPLACE MACRO convert_tz(ts, from_tz, to_tz) AS "
+               "mariadb_convert_tz(mariadb_datetime(ts, current_date), "
+               "from_tz, to_tz)");
+
+    /* Register cross-engine scan support (_mdb_scan + replacement scan) */
+    register_cross_engine_scan(*m_database->instance);
+
+    /* Quack: stock entry points closed, sessions guarded (MDEV-41383) */
+    m_quack_guard= quack_guard::Install(*m_database->instance, *con);
+
+    /*
+      Lock the DuckDB configuration so SQL reaching DuckDB (pushdown,
+      run_in_duckdb) cannot change it, e.g. re-enable extension
+      auto-install. Only the settings the plugin itself propagates from
+      MariaDB system variables (duckdb_config.cc) and session state
+      (DuckdbThdContext) stay changeable.
+    */
+    init_query("SET allowed_configs=["
+               "'memory_limit', 'max_temp_directory_size', 'threads', "
+               "'async_threads', 'scheduler_process_partial', "
+               "'allocator_flush_threshold', 'checkpoint_threshold', "
+               "'TimeZone', 'default_collation', 'merge_join_threshold', "
+               "'disabled_optimizers', 'explain_output']");
+    init_query("SET lock_configuration=true");
+
+    sql_print_information("DuckDB: DuckdbManager::Initialize succeed, path=%s",
+                          path);
+    return false;
+  }
+  catch (const std::exception &e)
+  {
+    sql_print_error("DuckDB: initialization failed at '%s': %s", path,
+                    e.what());
+  }
+  catch (...)
+  {
+    sql_print_error("DuckDB: initialization failed at '%s': unknown exception",
+                    path);
+  }
+
+  try
+  {
+    delete m_database;
+  }
+  catch (...)
+  {
+    sql_print_error("DuckDB: exception during failed initialization cleanup");
+  }
+  m_database= nullptr;
+  return true;
+}
+
+bool DuckdbManager::CreateInstance()
+{
+  DBUG_ASSERT(m_instance == nullptr);
+  m_instance= new DuckdbManager();
+  if (m_instance == nullptr)
+  {
+    sql_print_error("DuckDB: DuckdbManager::CreateInstance failed");
+    return true;
+  }
+
+  /* Eagerly initialize DuckDB so that errors are caught during plugin init
+     rather than later when the first query arrives. */
+  if (m_instance->Initialize())
+  {
+    sql_print_error("DuckDB: DuckdbManager::Initialize failed during "
+                    "CreateInstance");
+    delete m_instance;
+    m_instance= nullptr;
+    return true;
+  }
+
+  return false;
+}
+
+DuckdbManager::~DuckdbManager()
+{
+  /* Quack sessions hold the database: close them first */
+  StopQuackListener();
+  m_quack_guard.reset();
+  if (m_database != nullptr)
+  {
+    try
+    {
+      delete m_database;
+    }
+    catch (...)
+    {
+      sql_print_error("DuckDB: exception during DuckDB database destruction");
+    }
+    m_database= nullptr;
+  }
+}
+
+void DuckdbManager::Cleanup()
+{
+  if (m_instance == nullptr)
+    return;
+  delete m_instance;
+  m_instance= nullptr;
+}
+
+DuckdbManager &DuckdbManager::Get()
+{
+  DBUG_ASSERT(m_instance != nullptr);
+  return *m_instance;
+}
+
+std::shared_ptr<duckdb::Connection> DuckdbManager::CreateConnection()
+{
+  auto &instance= Get();
+  auto connection= std::make_shared<duckdb::Connection>(*instance.m_database);
+  return connection;
+}
+
+bool DuckdbManager::StartQuack(
+    const quack_guard::ListenerOptions &options,
+    std::shared_ptr<quack_guard::QuackAuthorizer> authorizer,
+    quack_guard::AuditLog audit)
+{
+  if (m_instance == nullptr || !m_instance->m_quack_guard)
+  {
+    sql_print_error("DuckDB: the Quack listener did not start: no database");
+    return false;
+  }
+  auto &instance= *m_instance;
+  std::lock_guard<std::mutex> guard(instance.m_quack_mutex);
+  if (instance.m_quack_listener)
+    return true;
+  try
+  {
+    instance.m_quack_guard->SetAuditLog(std::move(audit));
+    instance.m_quack_guard->SetAuthorizer(std::move(authorizer));
+    instance.m_quack_listener=
+        instance.m_quack_guard->StartListener(options);
+  }
+  catch (const std::exception &e)
+  {
+    instance.m_quack_guard->SetAuthorizer(nullptr);
+    instance.m_quack_guard->SetAuditLog(nullptr);
+    sql_print_error("DuckDB: the Quack listener did not start: %s",
+                    duckdb::ErrorData(e).RawMessage().c_str());
+    return false;
+  }
+  auto status= instance.m_quack_listener->Status();
+  std::string endpoints;
+  for (auto &endpoint : status.endpoints)
+    endpoints+= (endpoints.empty() ? "" : ", ") + endpoint;
+  sql_print_information("DuckDB: Quack listening on %s (TLS, certificate "
+                        "fingerprint %s)",
+                        endpoints.c_str(), status.fingerprint.c_str());
+  return true;
+}
+
+void DuckdbManager::StopQuackListener()
+{
+  std::unique_ptr<quack_guard::Listener> listener;
+  {
+    std::lock_guard<std::mutex> guard(m_quack_mutex);
+    listener= std::move(m_quack_listener);
+  }
+  if (listener)
+  {
+    listener->Stop();
+    sql_print_information("DuckDB: Quack listener stopped");
+  }
+  if (m_quack_guard)
+  {
+    m_quack_guard->SetAuthorizer(nullptr);
+    m_quack_guard->SetAuditLog(nullptr);
+  }
+}
+
+void DuckdbManager::StopQuack()
+{
+  if (m_instance != nullptr)
+    m_instance->StopQuackListener();
+}
+
+quack_guard::ListenerStatus DuckdbManager::QuackStatus()
+{
+  if (m_instance == nullptr)
+    return {};
+  std::lock_guard<std::mutex> guard(m_instance->m_quack_mutex);
+  return m_instance->m_quack_listener ? m_instance->m_quack_listener->Status()
+                                      : quack_guard::ListenerStatus();
+}
+
+quack_guard::GuardCounters DuckdbManager::QuackCounters()
+{
+  if (m_instance == nullptr || !m_instance->m_quack_guard)
+    return {};
+  return m_instance->m_quack_guard->Counters();
+}
+
+size_t DuckdbManager::QuackSessions()
+{
+  if (m_instance == nullptr || !m_instance->m_quack_guard)
+    return 0;
+  return m_instance->m_quack_guard->SessionCount();
+}
+
+} // namespace myduck

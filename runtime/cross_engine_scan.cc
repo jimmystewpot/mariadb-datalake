@@ -1,0 +1,689 @@
+/*
+  Copyright (c) 2026, MariaDB Foundation.
+  Copyright (c) 2026, Roman Nozdrin <drrtuy@gmail.com>
+  Copyright (c) 2026, Leonid Fedorov.
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; version 2 of the License.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335 USA
+*/
+
+#define MYSQL_SERVER 1
+#include <my_global.h>
+#include "sql_class.h"
+#include "field.h"
+#include "handler.h"
+#include "mysqld.h"
+#include "sql_time.h"
+#include "log.h"
+
+#undef UNKNOWN
+
+#include "cross_engine_scan.h"
+#include "fiber_scan.h"
+#include "ddl_convertor.h"
+#include "duckdb_log.h"
+#include "duckdb_timezone.h"
+#include "quack_guard/quack_guard.hpp"
+
+#include "duckdb/main/database.hpp"
+#include "duckdb/common/types/datetime.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+
+namespace myduck
+{
+
+/* ----------------------------------------------------------------
+   Thread-local registry of external (non-DuckDB) tables
+   ---------------------------------------------------------------- */
+
+static thread_local std::unordered_map<std::string, TABLE *>
+    tls_external_tables;
+static thread_local std::unordered_map<std::string, std::string>
+    tls_external_where;
+static thread_local bool tls_cross_engine_ryow= false;
+
+void register_external_table(const std::string &name, TABLE *table)
+{
+  tls_external_tables[name]= table;
+}
+
+void register_external_where(const std::string &name,
+                             const std::string &where_sql)
+{
+  tls_external_where[name]= where_sql;
+}
+
+std::string find_external_where(const std::string &name)
+{
+  auto it= tls_external_where.find(name);
+  if (it != tls_external_where.end())
+    return it->second;
+  return std::string();
+}
+
+void clear_external_tables()
+{
+  tls_external_tables.clear();
+  tls_external_where.clear();
+  tls_cross_engine_ryow= false;
+}
+
+TABLE *find_external_table(const std::string &name)
+{
+  auto it= tls_external_tables.find(name);
+  if (it != tls_external_tables.end())
+    return it->second;
+  return nullptr;
+}
+
+void register_cross_engine_ryow(bool enabled) { tls_cross_engine_ryow= enabled; }
+
+bool cross_engine_ryow_enabled() { return tls_cross_engine_ryow; }
+
+/* ----------------------------------------------------------------
+   MariaDB Field → DuckDB LogicalType mapping
+   ---------------------------------------------------------------- */
+
+static duckdb::LogicalType field_to_logical_type(const Field *field)
+{
+  bool is_unsigned= (field->flags & UNSIGNED_FLAG) != 0;
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+    return is_unsigned ? duckdb::LogicalType::UTINYINT
+                       : duckdb::LogicalType::TINYINT;
+  case MYSQL_TYPE_SHORT:
+    return is_unsigned ? duckdb::LogicalType::USMALLINT
+                       : duckdb::LogicalType::SMALLINT;
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+    return is_unsigned ? duckdb::LogicalType::UINTEGER
+                       : duckdb::LogicalType::INTEGER;
+  case MYSQL_TYPE_LONGLONG:
+    return is_unsigned ? duckdb::LogicalType::UBIGINT
+                       : duckdb::LogicalType::BIGINT;
+  case MYSQL_TYPE_FLOAT:
+    return duckdb::LogicalType::FLOAT;
+  case MYSQL_TYPE_DOUBLE:
+    return duckdb::LogicalType::DOUBLE;
+  case MYSQL_TYPE_DECIMAL:
+  case MYSQL_TYPE_NEWDECIMAL: {
+    auto *df= static_cast<const Field_new_decimal *>(field);
+    uint prec= df->precision > 38 ? 38 : df->precision;
+    return duckdb::LogicalType::DECIMAL(prec, df->dec);
+  }
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+    return duckdb::LogicalType::DATE;
+  case MYSQL_TYPE_TIME:
+  case MYSQL_TYPE_TIME2:
+    return duckdb::LogicalType::TIME;
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+    return duckdb::LogicalType::TIMESTAMP;
+  case MYSQL_TYPE_TIMESTAMP:
+  case MYSQL_TYPE_TIMESTAMP2:
+    return duckdb::LogicalType::TIMESTAMP_TZ;
+  case MYSQL_TYPE_YEAR:
+    return duckdb::LogicalType::INTEGER;
+  case MYSQL_TYPE_BIT:
+  case MYSQL_TYPE_GEOMETRY:
+    return duckdb::LogicalType::BLOB;
+  case MYSQL_TYPE_BLOB:
+  case MYSQL_TYPE_TINY_BLOB:
+  case MYSQL_TYPE_MEDIUM_BLOB:
+  case MYSQL_TYPE_LONG_BLOB:
+    return field->has_charset() ? duckdb::LogicalType::VARCHAR
+                                : duckdb::LogicalType::BLOB;
+  case MYSQL_TYPE_STRING:
+  case MYSQL_TYPE_VARCHAR:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_SET:
+  case MYSQL_TYPE_ENUM:
+    if (is_uuid_field(field))
+      return duckdb::LogicalType::UUID;
+    return duckdb::LogicalType::VARCHAR;
+  default:
+    return duckdb::LogicalType::VARCHAR;
+  }
+}
+
+/* ----------------------------------------------------------------
+   Read a MariaDB Field value → duckdb::Value
+   ---------------------------------------------------------------- */
+
+static duckdb::Value field_to_duckdb_value(Field *field)
+{
+  if (field->is_null())
+    return duckdb::Value();
+
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+  case MYSQL_TYPE_YEAR: {
+    if (field->is_unsigned())
+      return duckdb::Value::UBIGINT(field->val_uint());
+    return duckdb::Value::BIGINT(field->val_int());
+  }
+  case MYSQL_TYPE_FLOAT: {
+    float v;
+    v= static_cast<float>(field->val_real());
+    return duckdb::Value::FLOAT(v);
+  }
+  case MYSQL_TYPE_DOUBLE:
+    return duckdb::Value::DOUBLE(field->val_real());
+  case MYSQL_TYPE_DECIMAL:
+  case MYSQL_TYPE_NEWDECIMAL: {
+    String buf;
+    field->val_str(&buf);
+    return duckdb::Value(std::string(buf.ptr(), buf.length()));
+  }
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2: {
+    String buf;
+    field->val_str(&buf);
+    return duckdb::Value(std::string(buf.ptr(), buf.length()));
+  }
+  case MYSQL_TYPE_TIMESTAMP:
+  case MYSQL_TYPE_TIMESTAMP2: {
+    /* The column is TIMESTAMP_TZ; a string would be cast as UTC. */
+    return duckdb::Value::TIMESTAMPTZ(
+        duckdb::timestamp_tz_t(myduck::get_timestamp_epoch_us(field)));
+  }
+  case MYSQL_TYPE_TIME:
+  case MYSQL_TYPE_TIME2: {
+    MYSQL_TIME tm;
+    field->get_date(&tm, date_mode_t(0));
+    int64_t micros=
+        (tm.hour * 3600LL + tm.minute * 60LL + tm.second) * 1000000LL +
+        tm.second_part;
+    if (tm.neg)
+      micros= -micros;
+    return duckdb::Value::TIME(duckdb::dtime_t(micros));
+  }
+  case MYSQL_TYPE_BIT:
+  case MYSQL_TYPE_GEOMETRY: {
+    String buf;
+    field->val_str(&buf);
+    return duckdb::Value::BLOB(std::string(buf.ptr(), buf.length()));
+  }
+  case MYSQL_TYPE_BLOB:
+  case MYSQL_TYPE_TINY_BLOB:
+  case MYSQL_TYPE_MEDIUM_BLOB:
+  case MYSQL_TYPE_LONG_BLOB: {
+    String buf;
+    field->val_str(&buf);
+    if (field->has_charset())
+      return duckdb::Value(std::string(buf.ptr(), buf.length()));
+    return duckdb::Value::BLOB(std::string(buf.ptr(), buf.length()));
+  }
+  default: {
+    String buf;
+    field->val_str(&buf);
+    if (is_uuid_field(field))
+      return duckdb::Value::UUID(std::string(buf.ptr(), buf.length()));
+    return duckdb::Value(std::string(buf.ptr(), buf.length()));
+  }
+  }
+}
+
+/* ----------------------------------------------------------------
+   DuckDB table function: _mdb_scan
+   Wraps ha_rnd_init / ha_rnd_next on a MariaDB TABLE*.
+   ---------------------------------------------------------------- */
+
+struct MdbScanBindData : duckdb::FunctionData
+{
+  std::string table_key;
+  std::string where_sql;
+  TABLE *table= nullptr;
+  bool direct= false;
+
+  duckdb::unique_ptr<duckdb::FunctionData> Copy() const override
+  {
+    auto copy= duckdb::make_uniq<MdbScanBindData>();
+    copy->table_key= table_key;
+    copy->where_sql= where_sql;
+    copy->table= table;
+    copy->direct= direct;
+    return duckdb::unique_ptr<duckdb::FunctionData>(std::move(copy));
+  }
+
+  bool Equals(const duckdb::FunctionData &other) const override
+  {
+    return table_key == other.Cast<MdbScanBindData>().table_key;
+  }
+};
+
+struct MdbScanGlobalState : duckdb::GlobalTableFunctionState
+{
+  bool scan_started= false;
+  bool rnd_inited= false;
+  bool finished= false;
+  TABLE *table= nullptr;
+  duckdb::vector<duckdb::idx_t> column_ids;
+  std::string table_key;
+  std::string where_sql;
+  bool direct= false;
+
+  /* Fiber-based scan for predicate pushdown */
+  std::unique_ptr<FiberScanState> fiber;
+
+  idx_t MaxThreads() const override { return 1; }
+
+  /*
+    Ends the direct ha_rnd_init() scan, if one is open.  The server
+    asserts at unlock that no handler scan is left open, and DuckDB may
+    stop pulling before EOF (a conversion error, LIMIT, cancellation).
+  */
+  void end_rnd_scan()
+  {
+    if (!rnd_inited)
+      return;
+    rnd_inited= false;
+    THD *prev_thd= _current_thd();
+    if (table->in_use && table->in_use != prev_thd)
+      set_current_thd(table->in_use);
+    table->file->ha_rnd_end();
+    if (_current_thd() != prev_thd)
+      set_current_thd(prev_thd);
+  }
+
+  ~MdbScanGlobalState() override { end_rnd_scan(); }
+};
+
+/*
+  Fails the scan with handler error `err`.  The handler reports it first,
+  on the connection's THD, as the server would for its own read: the
+  client then gets that error's own code (a lock wait timeout as 1205, a
+  deadlock as 1213, after which InnoDB has rolled the transaction back,
+  KILL as "interrupted"), since the first error raised wins over the
+  generic one the select handler raises for this exception.
+*/
+[[noreturn]] static void throw_handler_error(TABLE *tbl, int err)
+{
+  THD *thd= tbl->in_use;
+  THD *prev_thd= _current_thd();
+  if (thd && thd != prev_thd)
+    set_current_thd(thd);
+  tbl->file->print_error(err, MYF(0));
+  const char *fallback= my_get_err_msg(err);
+  std::string text= thd && thd->get_stmt_da()->is_error()
+                        ? std::string(thd->get_stmt_da()->message())
+                        : std::string(fallback ? fallback : "unknown error");
+  if (_current_thd() != prev_thd)
+    set_current_thd(prev_thd);
+  throw duckdb::InvalidInputException(
+      "_mdb_scan of `%s`.`%s` failed: %s (handler error %d)",
+      std::string(tbl->s->db.str, tbl->s->db.length),
+      std::string(tbl->s->table_name.str, tbl->s->table_name.length),
+      text, err);
+}
+
+static duckdb::unique_ptr<duckdb::FunctionData>
+mdb_scan_bind(duckdb::ClientContext &context,
+              duckdb::TableFunctionBindInput &input,
+              duckdb::vector<duckdb::LogicalType> &return_types,
+              duckdb::vector<duckdb::Identifier> &names)
+{
+  /* Quack clients never reach MariaDB tables through this path */
+  if (quack_guard::IsQuackSession(context))
+    throw duckdb::PermissionException("_mdb_scan: not available over Quack");
+
+  auto key= input.inputs[0].GetValue<std::string>();
+
+  TABLE *tbl= find_external_table(key);
+  if (!tbl)
+    throw duckdb::BinderException("_mdb_scan: table '%s' not found in "
+                                  "external table registry",
+                                  key.c_str());
+
+  for (Field **f= tbl->field; *f && (*f)->invisible == VISIBLE; f++)
+  {
+    names.emplace_back(
+        std::string((*f)->field_name.str, (*f)->field_name.length));
+    return_types.push_back(field_to_logical_type(*f));
+  }
+
+  auto data= duckdb::make_uniq<MdbScanBindData>();
+  data->table_key= key;
+  data->where_sql= find_external_where(key);
+  data->table= tbl;
+  data->direct= cross_engine_ryow_enabled();
+  return duckdb::unique_ptr<duckdb::FunctionData>(std::move(data));
+}
+
+static duckdb::unique_ptr<duckdb::GlobalTableFunctionState>
+mdb_scan_init_global(duckdb::ClientContext &context,
+                     duckdb::TableFunctionInitInput &input)
+{
+  auto &bind_data= input.bind_data->Cast<MdbScanBindData>();
+  auto state= duckdb::make_uniq<MdbScanGlobalState>();
+  state->table= bind_data.table;
+  state->column_ids= input.column_ids;
+  state->table_key= bind_data.table_key;
+  state->where_sql= bind_data.where_sql;
+  state->direct= bind_data.direct;
+
+  if ((myduck::duckdb_log_options & LOG_DUCKDB_QUERY) && input.filters)
+  {
+    TABLE *tbl= bind_data.table;
+    for (auto &entry : *input.filters)
+    {
+      duckdb::idx_t proj_idx= entry.GetIndex();
+      std::string col_name= "?";
+      /* Map projected index → original column via column_ids → field name */
+      if (proj_idx < input.column_ids.size())
+      {
+        duckdb::idx_t orig_idx= input.column_ids[proj_idx];
+        uint i= 0;
+        for (Field **f= tbl->field; *f; f++, i++)
+        {
+          if (i == orig_idx)
+          {
+            col_name= (*f)->field_name.str;
+            break;
+          }
+        }
+      }
+      const duckdb::TableFilter &filter= entry.Filter();
+      std::string desc=
+          filter.filter_type == duckdb::TableFilterType::EXPRESSION_FILTER
+              ? filter.Cast<duckdb::ExpressionFilter>().ToString(col_name)
+              : "filter type " + std::to_string((int) filter.filter_type);
+      sql_print_information(
+          "CROSS-ENGINE: DuckDB filter[%llu] col='%s': %s",
+          (ulonglong) proj_idx, col_name.c_str(), desc.c_str());
+    }
+  }
+
+  return duckdb::unique_ptr<duckdb::GlobalTableFunctionState>(
+      std::move(state));
+}
+
+static void mdb_scan_function(duckdb::ClientContext &context,
+                              duckdb::TableFunctionInput &input,
+                              duckdb::DataChunk &output)
+{
+  auto &state= input.global_state->Cast<MdbScanGlobalState>();
+
+  if (state.finished)
+  {
+    output.SetChildCardinality(0);
+    return;
+  }
+
+  TABLE *tbl= state.table;
+  if (!tbl)
+  {
+    output.SetChildCardinality(0);
+    state.finished= true;
+    return;
+  }
+
+  /* ---- Lazy fiber initialization on first call ---- */
+  if (!state.scan_started)
+  {
+    const std::string &where_sql= state.where_sql;
+    /* RYOW mode reads via the direct handler scan below (parent trx);
+       otherwise use a fiber running a synthetic SELECT for pushdown. */
+    if (!state.direct)
+    {
+      duckdb::vector<duckdb::LogicalType> col_types;
+      uint nfields= tbl->s->fields;
+      for (auto col_idx : state.column_ids)
+      {
+        if (col_idx >= nfields)
+          col_types.push_back(duckdb::LogicalType::BIGINT);
+        else
+          col_types.push_back(field_to_logical_type(tbl->field[col_idx]));
+      }
+
+      state.fiber= std::make_unique<FiberScanState>();
+      if (state.fiber->init(tbl, state.column_ids, col_types, where_sql))
+      {
+        state.finished= true;
+        output.SetChildCardinality(0);
+        state.fiber.reset();
+        return;
+      }
+    }
+    state.scan_started= true;
+  }
+
+  /* ---- Fiber-based scan path ---- */
+  if (state.fiber)
+  {
+    /*
+      Save caller TLS and install fiber THD context.
+      Fibers share the OS thread, so we must swap current_thd and
+      my_thread_var manually around spawn/continue.
+    */
+    THD *prev_thd= _current_thd();
+    struct st_my_thread_var *prev_mysys= my_thread_var;
+    THD *fiber_thd= state.fiber->fiber_thd;
+
+    set_current_thd(fiber_thd);
+    if (fiber_thd && fiber_thd->mysys_var)
+      set_mysys_var(fiber_thd->mysys_var);
+
+    if (!state.fiber->fiber_started)
+    {
+      fiber_context_spawn(&state.fiber->ctx, fiber_scan_func,
+                          state.fiber.get());
+      state.fiber->fiber_started= true;
+    }
+    else
+    {
+      state.fiber->buffer.Reset();
+      fiber_context_continue(&state.fiber->ctx);
+    }
+
+    /* Restore caller TLS */
+    set_current_thd(prev_thd);
+    set_mysys_var(prev_mysys);
+
+    if (state.fiber->error)
+    {
+      state.finished= true;
+      throw duckdb::InvalidInputException(
+          "_mdb_scan of `%s`.`%s` failed: %s", state.fiber->db_name,
+          state.fiber->table_name,
+          state.fiber->error_msg.empty() ? std::string("unknown error")
+                                         : state.fiber->error_msg);
+    }
+
+    if (state.fiber->buffer.size() > 0)
+    {
+      output.Reference(state.fiber->buffer);
+      if (state.fiber->finished)
+        state.finished= true;
+    }
+    else
+    {
+      output.SetChildCardinality(0);
+      state.finished= true;
+    }
+    return;
+  }
+
+  /* ---- Fallback: direct ha_rnd_next (no fiber) ---- */
+  THD *prev_thd= _current_thd();
+  if (tbl->in_use && tbl->in_use != prev_thd)
+    set_current_thd(tbl->in_use);
+
+  if (!state.rnd_inited)
+  {
+    uint nf= tbl->s->fields;
+    bitmap_clear_all(tbl->read_set);
+    for (auto col_idx : state.column_ids)
+    {
+      if (col_idx < nf)
+        bitmap_set_bit(tbl->read_set, static_cast<uint>(col_idx));
+    }
+
+    int err= 0;
+    DBUG_EXECUTE_IF("duckdb_mdb_scan_init_error",
+                    err= HA_ERR_LOCK_WAIT_TIMEOUT;);
+    if (!err)
+      err= tbl->file->ha_rnd_init(true);
+    if (err)
+    {
+      state.finished= true;
+      if (_current_thd() != prev_thd)
+        set_current_thd(prev_thd);
+      throw_handler_error(tbl, err);
+    }
+    state.rnd_inited= true;
+  }
+
+  duckdb::idx_t count= 0;
+  duckdb::idx_t ncols= state.column_ids.size();
+  uint nfields= tbl->s->fields;
+
+  try
+  {
+    while (count < STANDARD_VECTOR_SIZE)
+    {
+      int err= tbl->file->ha_rnd_next(tbl->record[0]);
+      /* A read error the handler returns without reporting it itself */
+      DBUG_EXECUTE_IF("duckdb_mdb_scan_read_error",
+                      if (!err && count == 50) err= HA_ERR_LOCK_WAIT_TIMEOUT;);
+      if (err == HA_ERR_END_OF_FILE)
+      {
+        state.end_rnd_scan();
+        state.finished= true;
+        break;
+      }
+      /* Anything else (a lock wait timeout, a deadlock, KILL, an I/O
+         error) must fail the query, not end it with the rows so far */
+      if (err)
+        throw_handler_error(tbl, err);
+
+      for (duckdb::idx_t i= 0; i < ncols; i++)
+      {
+        if (state.column_ids[i] >= nfields)
+        {
+          output.data[i].SetValue(count, duckdb::Value());
+          continue;
+        }
+        Field *field= tbl->field[state.column_ids[i]];
+        duckdb::Value val= field_to_duckdb_value(field);
+        output.data[i].SetValue(count, val);
+      }
+      count++;
+    }
+  }
+  catch (...)
+  {
+    /* E.g. a value DuckDB cannot cast, such as DATETIME '0000-00-00'. */
+    state.finished= true;
+    if (_current_thd() != prev_thd)
+      set_current_thd(prev_thd);
+    state.end_rnd_scan();
+    throw;
+  }
+
+  output.SetChildCardinality(count);
+
+  if (_current_thd() != prev_thd)
+    set_current_thd(prev_thd);
+}
+
+/* ----------------------------------------------------------------
+   Replacement scan callback
+   ---------------------------------------------------------------- */
+
+duckdb::unique_ptr<duckdb::TableRef> mariadb_replacement_scan(
+    duckdb::ClientContext &context, duckdb::ReplacementScanInput &input,
+    duckdb::optional_ptr<duckdb::ReplacementScanData> data)
+{
+  if (quack_guard::IsQuackSession(context))
+    return nullptr;
+
+  TABLE *tbl= find_external_table(input.table_name);
+  if (!tbl)
+    return nullptr;
+
+  auto ref= duckdb::make_uniq<duckdb::TableFunctionRef>();
+
+  duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> children;
+  children.push_back(
+      duckdb::ConstantExpression::FromValue(duckdb::Value(input.table_name)));
+
+  const char *func_name=
+      cross_engine_ryow_enabled() ? "_mdb_scan_direct" : "_mdb_scan";
+
+  ref->function= duckdb::make_uniq<duckdb::FunctionExpression>(
+      func_name, std::move(children));
+  ref->alias= duckdb::Identifier(input.table_name);
+
+  if (myduck::duckdb_log_options & LOG_DUCKDB_QUERY)
+    sql_print_information(
+        "DuckDB cross-engine: replacement scan redirected '%s' to %s",
+        input.table_name.c_str(), func_name);
+
+  return duckdb::unique_ptr<duckdb::TableRef>(std::move(ref));
+}
+
+/* ----------------------------------------------------------------
+   Registration
+   ---------------------------------------------------------------- */
+
+void register_cross_engine_scan(duckdb::DatabaseInstance &db)
+{
+  duckdb::TableFunction mdb_scan("_mdb_scan", {duckdb::LogicalType::VARCHAR},
+                                 mdb_scan_function, mdb_scan_bind,
+                                 mdb_scan_init_global);
+  mdb_scan.projection_pushdown= true;
+  mdb_scan.filter_pushdown= true;
+
+  duckdb::CreateTableFunctionInfo info(std::move(mdb_scan));
+  auto &catalog= duckdb::Catalog::GetSystemCatalog(db);
+  auto transaction= duckdb::CatalogTransaction::GetSystemTransaction(db);
+  catalog.CreateFunction(transaction, info);
+
+  /* RYOW variant: reads via the parent transaction's handler, so it cannot
+     honor pushed-down filters.  Disable filter_pushdown so DuckDB keeps the
+     Filter operator above the scan and applies predicates itself. */
+  duckdb::TableFunction mdb_scan_direct(
+      "_mdb_scan_direct", {duckdb::LogicalType::VARCHAR}, mdb_scan_function,
+      mdb_scan_bind, mdb_scan_init_global);
+  mdb_scan_direct.projection_pushdown= true;
+  mdb_scan_direct.filter_pushdown= false;
+  duckdb::CreateTableFunctionInfo info_direct(std::move(mdb_scan_direct));
+  catalog.CreateFunction(transaction, info_direct);
+
+  auto &config= duckdb::DBConfig::GetConfig(db);
+  config.replacement_scans.emplace_back(mariadb_replacement_scan);
+
+  sql_print_information("DuckDB: cross-engine scan registered "
+                        "(_mdb_scan + _mdb_scan_direct + replacement scan)");
+}
+
+} /* namespace myduck */

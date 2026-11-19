@@ -1,0 +1,48 @@
+# Extensions required by the DuckDB storage engine plugin for MariaDB.
+# This config is passed to DuckDB via DUCKDB_EXTENSION_CONFIGS.
+# Keep in sync with _DUCKDB_LINKED_EXTENSIONS in cmake/duckdb.cmake.
+
+duckdb_extension_load(core_functions)
+duckdb_extension_statically_link(core_functions)
+duckdb_extension_load(icu)
+duckdb_extension_statically_link(icu)
+duckdb_extension_load(json)
+duckdb_extension_statically_link(json)
+duckdb_extension_load(parquet)
+duckdb_extension_statically_link(parquet)
+
+# httpfs gives read_parquet() and friends https://, http:// and s3:// paths.
+# It is out of tree since DuckDB 1.3; the pin is DuckDB v2.0.0's own
+# (.github/config/extensions/httpfs.cmake). Linked statically, like the
+# extensions above, because mysqld never installs extensions at runtime.
+if(WITH_DUCKDB_HTTPFS)
+  duckdb_extension_load(httpfs
+      GIT_URL https://github.com/duckdb/duckdb-httpfs
+      GIT_TAG a2485c0fd240cbddc0d467019f30201c9a46cf06
+      APPLY_PATCHES)
+  duckdb_extension_statically_link(httpfs)
+endif()
+
+if(WITH_DUCKDB_ICEBERG)
+  duckdb_extension_load(avro
+      GIT_URL https://github.com/duckdb/duckdb-avro
+      GIT_TAG b7b157f50dd0a3e6cfd30d9dd273a388fc2b9939
+      SUBMODULES "third_party/avro-c"
+      APPLY_PATCHES)
+  duckdb_extension_statically_link(avro)
+
+  duckdb_extension_load(iceberg
+      GIT_URL https://github.com/duckdb/duckdb-iceberg
+      GIT_TAG c639b0e0ffdd293d7fdce35b7aa3fdd6573ec157
+      APPLY_PATCHES)
+  duckdb_extension_statically_link(iceberg)
+endif()
+
+# Quack client/server protocol: third_parties/duckdb-quack (pinned to the
+# commit DuckDB itself pins) plus patches/duckdb-quack, staged by
+# cmake/duckdb.cmake into MARIADB_QUACK_SOURCE_DIR.
+duckdb_extension_load(quack
+    SOURCE_DIR ${MARIADB_QUACK_SOURCE_DIR}
+    INCLUDE_DIR ${MARIADB_QUACK_SOURCE_DIR}/src/include
+)
+duckdb_extension_statically_link(quack)

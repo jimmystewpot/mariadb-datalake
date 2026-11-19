@@ -1,0 +1,25 @@
+#pragma once
+
+#include "duckdb/common/unique_ptr.hpp"
+#include "mariadb_lexical_guard.h" /* mariadb_query_has_lexical_mismatch */
+
+#include <string>
+
+namespace duckdb
+{
+class Connection;
+class DatabaseInstance;
+class SQLStatement;
+struct DBConfig;
+}
+
+namespace myduck
+{
+
+void register_mariadb_dialect(duckdb::DBConfig &config);
+void register_mariadb_dialect(duckdb::DatabaseInstance &db);
+
+duckdb::unique_ptr<duckdb::SQLStatement>
+parse_mariadb_statement(duckdb::Connection &connection, const std::string &query);
+
+}
