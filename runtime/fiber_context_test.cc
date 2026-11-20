@@ -13,6 +13,7 @@
 #include "fiber_context.h"
 
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -182,6 +183,25 @@ TEST(continue_after_done)
   /* Calling continue on a finished fiber should return 0 (not crash). */
   rc = fiber_context_continue(&ctx);
   EXPECT(rc == 0);
+  EXPECT(fiber_context_yield(&ctx) == -1);
+
+  fiber_context_destroy(&ctx);
+
+  /* Also verify continue-after-done and yield-after-done after yielding once. */
+  EXPECT(fiber_context_init(&ctx, FIBER_STACK_SIZE) == 0);
+  single_yield_data d2 = {&ctx, 0};
+  rc = fiber_context_spawn(&ctx, single_yield_func, &d2);
+  EXPECT(rc == 1);
+  EXPECT(d2.phase == 1);
+
+  rc = fiber_context_continue(&ctx);
+  EXPECT(rc == 0);
+  EXPECT(d2.phase == 2);
+
+  rc = fiber_context_continue(&ctx);
+  EXPECT(rc == 0);
+  EXPECT(d2.phase == 2);
+  EXPECT(fiber_context_yield(&ctx) == -1);
 
   fiber_context_destroy(&ctx);
 }
@@ -194,7 +214,8 @@ static void deep_stack_func(void *arg)
   auto *d = (single_yield_data *)arg;
   /* Allocate ~16KB on the fiber stack. */
   volatile char buf[16384];
-  memset((char *)buf, 0xCC, sizeof(buf));
+  for (size_t i = 0; i < sizeof(buf); ++i)
+    buf[i] = static_cast<char>(0xCC);
   d->phase = (buf[0] == (char)0xCC && buf[16383] == (char)0xCC) ? 1 : -1;
   fiber_context_yield(d->ctx);
   d->phase = 2;
@@ -344,6 +365,54 @@ TEST(scan_simulation)
   EXPECT(continues == 7);
 
   fiber_context_destroy(&ctx);
+}
+
+/* ----------------------------------------------------------------
+   Test 10: misaligned stack sizes and 16-byte stack alignment
+   ---------------------------------------------------------------- */
+struct alignment_check_data {
+  struct fiber_context *ctx;
+  int misaligned_before;
+  int misaligned_after;
+};
+
+static void alignment_check_func(void *arg)
+{
+  auto *d = static_cast<alignment_check_data *>(arg);
+  alignas(16) volatile unsigned char simd_slot[64];
+  for (size_t i = 0; i < sizeof(simd_slot); ++i)
+    simd_slot[i] = static_cast<unsigned char>(i);
+  d->misaligned_before =
+      ((reinterpret_cast<uintptr_t>(simd_slot) & 0xFU) != 0U) ? 1 : 0;
+  fiber_context_yield(d->ctx);
+  for (size_t i = 0; i < sizeof(simd_slot); ++i)
+    simd_slot[i] = static_cast<unsigned char>(i + 1U);
+  d->misaligned_after =
+      ((reinterpret_cast<uintptr_t>(simd_slot) & 0xFU) != 0U) ? 1 : 0;
+}
+
+TEST(misaligned_stack_sizes_and_alignment)
+{
+  for (size_t offset : {static_cast<size_t>(1), static_cast<size_t>(3),
+                        static_cast<size_t>(7), static_cast<size_t>(13),
+                        static_cast<size_t>(15)})
+  {
+    struct fiber_context ctx;
+    EXPECT(fiber_context_init(&ctx, FIBER_STACK_SIZE + offset) == 0);
+#if defined(FIBER_USE_X86_64_GCC_ASM) || \
+    defined(FIBER_USE_I386_GCC_ASM) || \
+    defined(FIBER_USE_AARCH64_GCC_ASM)
+    EXPECT((reinterpret_cast<uintptr_t>(ctx.stack_top) & 0xFU) == 0U);
+#endif
+    alignment_check_data d{&ctx, -1, -1};
+    int rc = fiber_context_spawn(&ctx, alignment_check_func, &d);
+    EXPECT(rc == 1);
+    rc = fiber_context_continue(&ctx);
+    EXPECT(rc == 0);
+    EXPECT(d.misaligned_before == 0);
+    EXPECT(d.misaligned_after == 0);
+    fiber_context_destroy(&ctx);
+  }
 }
 
 /* ----------------------------------------------------------------

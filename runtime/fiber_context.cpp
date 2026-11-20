@@ -24,6 +24,8 @@
   my_context_* to fiber_context_*.
 */
 
+#include <cstdint>
+#include <cstring>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,21 +39,15 @@
 
 typedef void (*uc_func_t)(void);
 
-union pass_void_ptr_as_2_int {
-  int a[2];
-  void *p;
-};
-
 static void
-fiber_context_spawn_internal(int i0, int i1)
+fiber_context_spawn_internal(int a0, int a1)
 {
   int err;
-  struct fiber_context *c;
-  union pass_void_ptr_as_2_int u;
-
-  u.a[0]= i0;
-  u.a[1]= i1;
-  c= (struct fiber_context *)u.p;
+  struct fiber_context *c= nullptr;
+  int a[2]= {a0, a1};
+  static_assert(sizeof(c) <= sizeof(a),
+                "fiber_context pointer must fit in 2 ints");
+  std::memcpy(&c, a, sizeof(c));
 
   (*c->user_func)(c->user_data);
   c->active= 0;
@@ -85,7 +81,9 @@ int
 fiber_context_spawn(struct fiber_context *c, void (*f)(void *), void *d)
 {
   int err;
-  union pass_void_ptr_as_2_int u;
+  int a[2]= {0, 0};
+  static_assert(sizeof(c) <= sizeof(a),
+                "fiber_context pointer must fit in 2 ints");
 
   err= getcontext(&c->spawned_context);
   if (err)
@@ -96,14 +94,13 @@ fiber_context_spawn(struct fiber_context *c, void (*f)(void *), void *d)
   c->user_func= f;
   c->user_data= d;
   c->active= 1;
-  u.a[1]= 0;
-  u.p= c;
+  std::memcpy(a, &c, sizeof(c));
 #ifdef __clang__
 # pragma clang diagnostic push
 # pragma clang diagnostic ignored "-Wcast-function-type-strict"
 #endif
   makecontext(&c->spawned_context, (uc_func_t)fiber_context_spawn_internal, 2,
-              u.a[0], u.a[1]);
+              a[0], a[1]);
 #ifdef __clang__
 # pragma clang diagnostic pop
 #endif
@@ -153,6 +150,7 @@ fiber_context_spawn(struct fiber_context *c, void (*f)(void *), void *d)
 {
   int ret;
 
+  c->active= 1;
   __asm__ __volatile__
     (
      "movq %%rsp, (%[save])\n\t"
@@ -186,6 +184,7 @@ fiber_context_spawn(struct fiber_context *c, void (*f)(void *), void *d)
        [save] "b" (&c->save[0])
      : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc"
   );
+  c->active= ret;
 
   return ret;
 }
@@ -194,6 +193,9 @@ int
 fiber_context_continue(struct fiber_context *c)
 {
   int ret;
+
+  if (!c->active)
+    return 0;
 
   __asm__ __volatile__
     (
@@ -243,6 +245,7 @@ fiber_context_continue(struct fiber_context *c)
      : [save] "b" (&c->save[0])
      : "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory", "cc"
         );
+  c->active= ret;
 
   return ret;
 }
@@ -251,6 +254,10 @@ int
 fiber_context_yield(struct fiber_context *c)
 {
   uint64_t *save= &c->save[0];
+
+  if (!c->active)
+    return -1;
+
   __asm__ __volatile__
     (
      "movq (%[save]), %%rax\n\t"
@@ -299,8 +306,10 @@ fiber_context_init(struct fiber_context *c, size_t stack_size)
     The x86_64 ABI specifies 16-byte stack alignment.
     Also put two zero words at the top of the stack.
   */
-  c->stack_top= (void *)
-    (( ((intptr_t)c->stack_bot + stack_size) & ~(intptr_t)0xf) - 16);
+  c->stack_top= reinterpret_cast<void *>(
+      ((reinterpret_cast<uintptr_t>(c->stack_bot) + stack_size) &
+       ~static_cast<uintptr_t>(0xfU)) -
+      16U);
   memset(c->stack_top, 0, 16);
 
   return 0;
@@ -323,6 +332,7 @@ fiber_context_spawn(struct fiber_context *c, void (*f)(void *), void *d)
 {
   int ret;
 
+  c->active= 1;
   __asm__ __volatile__
     (
      "movl %%esp, (%[save])\n\t"
@@ -358,6 +368,7 @@ fiber_context_spawn(struct fiber_context *c, void (*f)(void *), void *d)
        [save] "D" (&c->save[0])
      : "memory", "cc"
   );
+  c->active= ret;
 
   return ret;
 }
@@ -366,6 +377,9 @@ int
 fiber_context_continue(struct fiber_context *c)
 {
   int ret;
+
+  if (!c->active)
+    return 0;
 
   __asm__ __volatile__
     (
@@ -411,6 +425,7 @@ fiber_context_continue(struct fiber_context *c)
      : [save] "D" (&c->save[0])
      : "ecx", "edx", "memory", "cc"
         );
+  c->active= ret;
 
   return ret;
 }
@@ -419,6 +434,10 @@ int
 fiber_context_yield(struct fiber_context *c)
 {
   uint64_t *save= &c->save[0];
+
+  if (!c->active)
+    return -1;
+
   __asm__ __volatile__
     (
      "movl (%[save]), %%eax\n\t"
@@ -460,8 +479,10 @@ fiber_context_init(struct fiber_context *c, size_t stack_size)
   memset(c, 0, sizeof(*c));
   if (!(c->stack_bot= malloc(stack_size)))
     return -1;
-  c->stack_top= (void *)
-    (( ((intptr_t)c->stack_bot + stack_size) & ~(intptr_t)0xf) - 16);
+  c->stack_top= reinterpret_cast<void *>(
+      ((reinterpret_cast<uintptr_t>(c->stack_bot) + stack_size) &
+       ~static_cast<uintptr_t>(0xfU)) -
+      16U);
   memset(c->stack_top, 0, 16);
 
   return 0;
@@ -494,6 +515,7 @@ fiber_context_spawn(struct fiber_context *c, void (*f)(void *), void *d)
   register void *stack asm("x13") = c->stack_top;
   register const uint64_t *save asm("x19") = &c->save[0];
 
+  c->active= 1;
   __asm__ __volatile__
     (
      "mov x10, sp\n\t"
@@ -545,6 +567,7 @@ fiber_context_spawn(struct fiber_context *c, void (*f)(void *), void *d)
        "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
        "memory", "cc"
   );
+  c->active= ret;
 
   return ret;
 }
@@ -552,6 +575,9 @@ fiber_context_spawn(struct fiber_context *c, void (*f)(void *), void *d)
 int
 fiber_context_continue(struct fiber_context *c)
 {
+  if (!c->active)
+    return 0;
+
   register int ret asm("w0");
   register const uint64_t *save asm("x19") = &c->save[0];
 
@@ -645,6 +671,7 @@ fiber_context_continue(struct fiber_context *c)
        "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
        "memory", "cc"
         );
+  c->active= ret;
 
   return ret;
 }
@@ -652,6 +679,9 @@ fiber_context_continue(struct fiber_context *c)
 int
 fiber_context_yield(struct fiber_context *c)
 {
+  if (!c->active)
+    return -1;
+
   register const uint64_t *save asm("x19") = &c->save[0];
   __asm__ __volatile__
     (
@@ -736,8 +766,10 @@ fiber_context_init(struct fiber_context *c, size_t stack_size)
 
   if (!(c->stack_bot= malloc(stack_size)))
     return -1;
-  c->stack_top= (void *)
-    (( ((intptr_t)c->stack_bot + stack_size) & ~(intptr_t)0xf) - 16);
+  c->stack_top= reinterpret_cast<void *>(
+      ((reinterpret_cast<uintptr_t>(c->stack_bot) + stack_size) &
+       ~static_cast<uintptr_t>(0xfU)) -
+      16U);
   memset(c->stack_top, 0, 16);
 
   return 0;
