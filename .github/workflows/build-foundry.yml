@@ -27,3 +27,44 @@ jobs:
       # Quack (MDEV-41383) serves HTTPS through the system OpenSSL
       extra_packages_deb: libssl-dev
       extra_packages_rpm: openssl-devel
+
+  layer-a-sanitizers:
+    name: Layer A (${{ matrix.compiler.name }} / ${{ matrix.sanitizer.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - { name: gcc, cc: gcc, cxx: g++ }
+          - { name: clang, cc: clang, cxx: clang++ }
+        sanitizer:
+          - { name: asan-ubsan, flags: "-DWITH_ASAN=ON -DWITH_UBSAN=ON" }
+          - { name: ubsan-only, flags: "-DWITH_ASAN=OFF -DWITH_UBSAN=ON" }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake ninja-build libssl-dev zlib1g-dev
+
+      - name: Configure Layer A
+        env:
+          CC: ${{ matrix.compiler.cc }}
+          CXX: ${{ matrix.compiler.cxx }}
+        run: |
+          cmake -S . -B build -DSTANDALONE_TESTS=ON -DDUCKDB_WERROR=ON ${{ matrix.sanitizer.flags }}
+
+      - name: Build Layer A
+        run: |
+          cmake --build build --parallel $(nproc)
+
+      - name: Run Layer A CTest
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+        run: |
+          ctest --test-dir build --output-on-failure

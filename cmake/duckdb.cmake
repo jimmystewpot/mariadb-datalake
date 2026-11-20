@@ -40,7 +40,7 @@ ELSE()
   SET(_DUCKDB_BUILD_TYPE "Release")
 ENDIF()
 
-IF(NOT "${_MAIN_REPO_ROOT}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}" AND
+IF(NOT "${CMAKE_CURRENT_BINARY_DIR}" STREQUAL "${_MAIN_REPO_ROOT}/build" AND
    EXISTS "${_MAIN_REPO_ROOT}/build/duckdb-build/src/libduckdb_static.a" AND
    EXISTS "${_MAIN_REPO_ROOT}/build/duckdb-deps-install/lib/libroaring.a")
   SET(_DUCKDB_BUILD_DIR "${_MAIN_REPO_ROOT}/build/duckdb-build")

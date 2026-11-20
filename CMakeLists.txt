@@ -47,7 +47,7 @@ SET(DUCKDB_PLUGIN_SOURCES
   bridge/bridge_test_udf.cc
 )
 
-IF(mariadb-plugin_FOUND)
+IF(mariadb-plugin_FOUND AND NOT STANDALONE_TESTS)
   MARIADB_ADD_PLUGIN(duckdb ${DUCKDB_PLUGIN_SOURCES} STORAGE_ENGINE MODULE_ONLY
                      AUTHOR "drrtuy,lfedorov"
                      VERSION "${DUCKDB_PLUGIN_VERSION}"
@@ -101,8 +101,27 @@ IF(TARGET duckdb)
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     ${CMAKE_CURRENT_SOURCE_DIR}/lakehouse/include
   )
-ELSEIF(NOT mariadb-plugin_FOUND)
+
+  IF(DUCKDB_UNIT_TESTS)
+    IF(TARGET quack_guard_test)
+      ADD_TEST(NAME quack_guard_test COMMAND quack_guard_test)
+    ENDIF()
+    IF(TARGET mariadb_dialect_test)
+      ADD_TEST(NAME mariadb_dialect_test COMMAND mariadb_dialect_test)
+    ENDIF()
+    IF(TARGET fiber_context_test)
+      ADD_TEST(NAME fiber_context_test COMMAND fiber_context_test)
+    ENDIF()
+  ENDIF()
+ELSEIF(STANDALONE_TESTS OR NOT mariadb-plugin_FOUND)
   MESSAGE(STATUS "DuckDB: mariadb-plugin SDK not found; building Layer A standalone targets")
+  SET(DUCKDB_UNIT_TESTS ON)
+  IF(NOT "${CMAKE_CURRENT_BINARY_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/build" AND
+     EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/build/_deps/googletest-src" AND
+     NOT DEFINED FETCHCONTENT_SOURCE_DIR_GOOGLETEST)
+    SET(FETCHCONTENT_SOURCE_DIR_GOOGLETEST
+        "${CMAKE_CURRENT_SOURCE_DIR}/build/_deps/googletest-src")
+  ENDIF()
   FIND_PACKAGE(OpenSSL REQUIRED)
 
   INCLUDE(${CMAKE_CURRENT_SOURCE_DIR}/cmake/duckdb.cmake)
@@ -137,6 +156,20 @@ ELSEIF(NOT mariadb-plugin_FOUND)
     pthread dl
     -Wl,--wrap=_ZN6duckdb21PEGTransformerFactory26TransformTopLevelStatementERNS_13TokenIteratorERNS_13ParserOptionsERKNS_15CompiledGrammarE)
   ADD_TEST(NAME mariadb_dialect_test COMMAND mariadb_dialect_test)
+
+  ADD_EXECUTABLE(fiber_context_test
+    runtime/fiber_context_test.cc
+    runtime/fiber_context.cpp
+  )
+  TARGET_INCLUDE_DIRECTORIES(fiber_context_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+  )
+  duckdb_setup_target(fiber_context_test)
+  CHECK_CXX_COMPILER_FLAG("-Wno-frame-larger-than" DUCKDB_HAS_WNO_FRAME_LARGER_THAN)
+  IF(DUCKDB_HAS_WNO_FRAME_LARGER_THAN)
+    TARGET_COMPILE_OPTIONS(fiber_context_test PRIVATE -Wno-frame-larger-than)
+  ENDIF()
+  ADD_TEST(NAME fiber_context_test COMMAND fiber_context_test)
 ENDIF()
 
 IF(mariadb-plugin_FOUND)
