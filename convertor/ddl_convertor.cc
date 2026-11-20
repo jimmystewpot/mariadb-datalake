@@ -141,14 +141,20 @@ static std::string get_default_expr_from_vcol_defs(const TABLE_SHARE *share,
 
   while (pos < end)
   {
+    if (static_cast<size_t>(end - pos) < 6)
+      break;
     uint type= pos[0];
     uint field_nr= uint2korr(pos + 1);
     uint expr_len= uint2korr(pos + 3);
     uint name_len= pos[5];
-    pos+= 6 + name_len; /* FRM_VCOL_NEW_HEADER_SIZE + name */
+    pos+= 6; /* FRM_VCOL_NEW_HEADER_SIZE */
+    if (static_cast<size_t>(end - pos) <
+        static_cast<size_t>(name_len) + static_cast<size_t>(expr_len))
+      break;
+    pos+= name_len;
 
     if (type == 2 /* VCOL_DEFAULT */ && field_nr == target_field_nr)
-      return std::string((const char *) pos, expr_len);
+      return std::string(reinterpret_cast<const char *>(pos), expr_len);
 
     pos+= expr_len;
   }
@@ -719,7 +725,9 @@ std::string FieldConvertor::convert_type(const Field *field)
   /* MariaDB does not have MYSQL_TYPE_JSON; JSON is stored as LONG_BLOB with
      a special charset. This is handled by the blob/varchar path above. */
 
-  std::transform(ret.begin(), ret.end(), ret.begin(), ::toupper);
+  std::transform(ret.begin(), ret.end(), ret.begin(), [](unsigned char c) {
+    return static_cast<char>(std::toupper(c));
+  });
 
   return ret;
 }

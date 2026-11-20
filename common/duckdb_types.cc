@@ -26,40 +26,36 @@
 #include "m_string.h"
 #include "sql_table.h"
 
+static inline bool is_path_separator(char c)
+{
+  return c == '\\' || c == '/';
+}
+
 /* Refers to create_table_info_t::normalize_table_name */
 DatabaseTableNames::DatabaseTableNames(const char *name)
 {
-  const char *name_ptr;
-  size_t name_len;
-  const char *db_ptr;
-  size_t db_len;
-  const char *ptr;
-
-  /* Scan name from the end */
-  ptr= strend(name) - 1;
+  size_t total_len= strlen(name);
+  size_t idx= total_len;
 
   /* seek to the last path separator */
-  while (ptr >= name && *ptr != '\\' && *ptr != '/')
-    ptr--;
+  while (idx > 0 && !is_path_separator(name[idx - 1]))
+    --idx;
 
-  name_ptr= ptr + 1;
-  name_len= strlen(name_ptr);
+  const char *name_ptr= name + idx;
+  size_t name_len= total_len - idx;
 
   /* skip any number of path separators */
-  while (ptr >= name && (*ptr == '\\' || *ptr == '/'))
-    ptr--;
+  while (idx > 0 && is_path_separator(name[idx - 1]))
+    --idx;
 
-  assert(ptr >= name);
+  size_t db_end= idx;
 
   /* seek to the last but one path separator */
-  db_len= 0;
-  while (ptr >= name && *ptr != '\\' && *ptr != '/')
-  {
-    ptr--;
-    db_len++;
-  }
+  while (idx > 0 && !is_path_separator(name[idx - 1]))
+    --idx;
 
-  db_ptr= ptr + 1;
+  const char *db_ptr= name + idx;
+  size_t db_len= db_end - idx;
 
   std::string raw_table_name= std::string(name_ptr, name_len);
   std::string raw_db_name= std::string(db_ptr, db_len);
@@ -110,22 +106,25 @@ std::string quote_duckdb_identifier(const char *name, size_t length)
 Databasename::Databasename(const char *path_name)
 {
   char dbname[FN_REFLEN];
-  const char *end, *ptr;
   char tmp_buff[FN_REFLEN + 1];
 
-  char *tmp_name= tmp_buff;
-  /* Scan name from the end */
-  ptr= strend(path_name) - 1;
-  while (ptr >= path_name && *ptr != '\\' && *ptr != '/')
-    ptr--;
-  ptr--;
-  end= ptr;
-  while (ptr >= path_name && *ptr != '\\' && *ptr != '/')
-    ptr--;
-  uint name_len= (uint) (end - ptr);
-  memcpy(tmp_name, ptr + 1, name_len);
-  tmp_name[name_len]= '\0';
+  size_t len= strlen(path_name);
+  size_t end_idx= len;
+  while (end_idx > 0 && !is_path_separator(path_name[end_idx - 1]))
+    --end_idx;
+  if (end_idx > 0)
+    --end_idx;
+  size_t start_idx= end_idx;
+  while (start_idx > 0 && !is_path_separator(path_name[start_idx - 1]))
+    --start_idx;
 
-  filename_to_tablename(tmp_name, dbname, sizeof(tmp_buff) - 1);
-  name= std::string(dbname);
+  size_t name_len= end_idx - start_idx;
+  if (name_len > FN_REFLEN)
+    name_len= FN_REFLEN;
+  if (name_len > 0)
+    memcpy(tmp_buff, path_name + start_idx, name_len);
+  tmp_buff[name_len]= '\0';
+
+  size_t db_len= filename_to_tablename(tmp_buff, dbname, sizeof(tmp_buff) - 1);
+  name= std::string(dbname, db_len);
 }

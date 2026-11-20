@@ -137,10 +137,11 @@ static void ord_byte_func(duckdb::DataChunk &args,
                           duckdb::ExpressionState &state,
                           duckdb::Vector &result)
 {
-  duckdb::UnaryExecutor::Execute<duckdb::string_t, int32_t>(
+  (void) state;
+  duckdb::UnaryExecutor::Execute<duckdb::string_t, int64_t>(
       args.data[0], result, args.size(),
-      [](duckdb::string_t s) -> int32_t {
-        auto data= (const unsigned char *) s.GetData();
+      [](duckdb::string_t s) -> int64_t {
+        const auto *data= reinterpret_cast<const unsigned char *>(s.GetData());
         auto size= s.GetSize();
         if (size == 0)
           return 0;
@@ -155,11 +156,13 @@ static void ord_byte_func(duckdb::DataChunk &args,
           char_len= 2;
         /* Single byte — same as ASCII */
         if (char_len == 1)
-          return (int32_t) c;
+          return static_cast<int64_t>(c);
         /* Multibyte: (b1 * 256 + b2) * 256 + b3 ... */
-        int32_t val= 0;
-        for (int i= 0; i < char_len && i < (int) size; i++)
-          val= val * 256 + data[i];
+        int64_t val= 0;
+        for (int i= 0; i < char_len && i < static_cast<int>(size); i++)
+        {
+          val= (val << 8) | static_cast<int64_t>(data[i]);
+        }
         return val;
       });
 }
@@ -395,7 +398,7 @@ static void WriteHexBytes(uint64_t x, char *&output, idx_t buffer_size)
   idx_t offset= buffer_size * 4;
   for (; offset >= 4; offset -= 4)
   {
-    uint8_t byte= (x >> (offset - 4)) & 0x0F;
+    uint8_t byte= static_cast<uint8_t>((x >> (offset - 4)) & 0x0FU);
     *output= Blob::HEX_TABLE[byte];
     output++;
   }
@@ -405,19 +408,19 @@ template <class T>
 static void WriteHugeIntHexBytes(T x, char *&output, idx_t buffer_size)
 {
   idx_t offset= buffer_size * 4;
-  auto upper= x.upper;
-  auto lower= x.lower;
+  uint64_t upper= static_cast<uint64_t>(x.upper);
+  uint64_t lower= x.lower;
 
   for (; offset >= 68; offset -= 4)
   {
-    uint8_t byte= (upper >> (offset - 68)) & 0x0F;
+    uint8_t byte= static_cast<uint8_t>((upper >> (offset - 68)) & 0x0FU);
     *output= Blob::HEX_TABLE[byte];
     output++;
   }
 
   for (; offset >= 4; offset -= 4)
   {
-    uint8_t byte= (lower >> (offset - 4)) & 0x0F;
+    uint8_t byte= static_cast<uint8_t>((lower >> (offset - 4)) & 0x0FU);
     *output= Blob::HEX_TABLE[byte];
     output++;
   }
@@ -430,7 +433,7 @@ static void WriteBinBytes(uint64_t x, char *&output, idx_t buffer_size)
   idx_t offset= buffer_size;
   for (; offset >= 1; offset -= 1)
   {
-    *output= NumericCast<char>(((x >> (offset - 1)) & 0x01) + '0');
+    *output= NumericCast<char>(((x >> (offset - 1)) & 0x01U) + '0');
     output++;
   }
 }
@@ -438,19 +441,19 @@ static void WriteBinBytes(uint64_t x, char *&output, idx_t buffer_size)
 template <class T>
 static void WriteHugeIntBinBytes(T x, char *&output, idx_t buffer_size)
 {
-  auto upper= x.upper;
-  auto lower= x.lower;
+  uint64_t upper= static_cast<uint64_t>(x.upper);
+  uint64_t lower= x.lower;
   idx_t offset= buffer_size;
 
   for (; offset >= 65; offset -= 1)
   {
-    *output= ((upper >> (offset - 65)) & 0x01) + '0';
+    *output= static_cast<char>(((upper >> (offset - 65)) & 0x01U) + '0');
     output++;
   }
 
   for (; offset >= 1; offset -= 1)
   {
-    *output= ((lower >> (offset - 1)) & 0x01) + '0';
+    *output= static_cast<char>(((lower >> (offset - 1)) & 0x01U) + '0');
     output++;
   }
 }
@@ -462,7 +465,7 @@ static void WriteOctBytes(uint64_t x, char *&output, idx_t buffer_size)
   idx_t offset= buffer_size * 3;
   for (; offset >= 3; offset -= 3)
   {
-    uint8_t byte= (x >> (offset - 3)) & 0x07;
+    uint8_t byte= static_cast<uint8_t>((x >> (offset - 3)) & 0x07U);
     *output= Blob::HEX_TABLE[byte];
     output++;
   }
@@ -472,27 +475,29 @@ template <class T>
 static void WriteHugeIntOctBytes(T x, char *&output, idx_t buffer_size)
 {
   idx_t offset= buffer_size * 3;
-  auto upper= x.upper;
-  auto lower= x.lower;
+  uint64_t upper= static_cast<uint64_t>(x.upper);
+  uint64_t lower= x.lower;
 
   for (; offset >= 69; offset -= 3)
   {
-    uint8_t byte= (upper >> (offset - 66)) & 0x07;
-    *output= Blob::HEX_TABLE[byte];
+    uint8_t byte= static_cast<uint8_t>((upper >> (offset - 67)) & 0x07U);
+    *output= static_cast<char>('0' + byte);
     output++;
   }
 
+  if (offset == 66)
   {
-    uint8_t byte= ((upper & 0x03) << 1) + ((lower >> offset) & 0x01);
-    *output= Blob::HEX_TABLE[byte];
+    uint8_t byte=
+        static_cast<uint8_t>(((upper & 0x03U) << 1U) | ((lower >> 63U) & 0x01U));
+    *output= static_cast<char>('0' + byte);
     output++;
     offset -= 3;
   }
 
   for (; offset >= 3; offset -= 3)
   {
-    uint8_t byte= (lower >> (offset - 3)) & 0x07;
-    *output= Blob::HEX_TABLE[byte];
+    uint8_t byte= static_cast<uint8_t>((lower >> (offset - 3)) & 0x07U);
+    *output= static_cast<char>('0' + byte);
     output++;
   }
 }
@@ -513,9 +518,10 @@ struct HexStrOperator {
 
     for (idx_t i= 0; i < size; ++i)
     {
-      *output= Blob::HEX_TABLE[(data[i] >> 4) & 0x0F];
+      uint8_t byte= static_cast<uint8_t>(data[i]);
+      *output= Blob::HEX_TABLE[(byte >> 4U) & 0x0FU];
       output++;
-      *output= Blob::HEX_TABLE[data[i] & 0x0F];
+      *output= Blob::HEX_TABLE[byte & 0x0FU];
       output++;
     }
 
@@ -523,6 +529,32 @@ struct HexStrOperator {
     return target;
   }
 };
+
+template <class INPUT_TYPE>
+static int64_t SafeRoundFloatToInt64(INPUT_TYPE input)
+{
+  double rounded= std::round(static_cast<double>(input));
+  if (!std::isfinite(rounded))
+  {
+    return 0;
+  }
+  constexpr double kMinInt64= -9223372036854775808.0; // -2^63
+  constexpr double kMaxInt64Exclusive= 9223372036854775808.0; // 2^63
+  constexpr double kMaxUint64Exclusive= 18446744073709551616.0; // 2^64
+  if (rounded < kMinInt64)
+  {
+    return std::numeric_limits<int64_t>::min();
+  }
+  if (rounded >= kMaxInt64Exclusive)
+  {
+    if (rounded < kMaxUint64Exclusive)
+    {
+      return static_cast<int64_t>(static_cast<uint64_t>(rounded));
+    }
+    return -1;
+  }
+  return static_cast<int64_t>(rounded);
+}
 
 struct HexIntegralOperator {
   template <class INPUT_TYPE, class RESULT_TYPE>
@@ -615,7 +647,7 @@ struct HexFloatOperator {
   template <class INPUT_TYPE, class RESULT_TYPE>
   static RESULT_TYPE Operation(INPUT_TYPE input, StringHeap &heap)
   {
-    int64_t input_integer= std::round(input);
+    int64_t input_integer= SafeRoundFloatToInt64(input);
     return HexIntegralOperator::Operation<int64_t, string_t>(input_integer,
                                                              heap);
   }
@@ -662,8 +694,8 @@ struct OctHugeIntOperator {
   {
     idx_t num_leading_zero=
         CountZeros<hugeint_t>::Leading(UnsafeNumericCast<hugeint_t>(input));
-    idx_t buffer_size=
-        (sizeof(INPUT_TYPE) * 2 - num_leading_zero + 2) / 3;
+    idx_t num_bits= sizeof(INPUT_TYPE) * 8 - num_leading_zero;
+    idx_t buffer_size= (num_bits + 2) / 3;
 
     if (buffer_size == 0)
     {
@@ -691,8 +723,8 @@ struct OctUhugeIntOperator {
   {
     idx_t num_leading_zero=
         CountZeros<uhugeint_t>::Leading(UnsafeNumericCast<uhugeint_t>(input));
-    idx_t buffer_size=
-        (sizeof(INPUT_TYPE) * 2 - num_leading_zero + 2) / 3;
+    idx_t num_bits= sizeof(INPUT_TYPE) * 8 - num_leading_zero;
+    idx_t buffer_size= (num_bits + 2) / 3;
 
     if (buffer_size == 0)
     {
@@ -718,7 +750,7 @@ struct OctFloatOperator {
   template <class INPUT_TYPE, class RESULT_TYPE>
   static RESULT_TYPE Operation(INPUT_TYPE input, StringHeap &heap)
   {
-    int64_t input_integer= std::round(input);
+    int64_t input_integer= SafeRoundFloatToInt64(input);
     return OctIntegralOperator::Operation<int64_t, string_t>(input_integer,
                                                              heap);
   }
@@ -842,7 +874,7 @@ struct BinaryFloatOperator {
   template <class INPUT_TYPE, class RESULT_TYPE>
   static RESULT_TYPE Operation(INPUT_TYPE input, StringHeap &heap)
   {
-    int64_t input_integer= std::round(input);
+    int64_t input_integer= SafeRoundFloatToInt64(input);
     return BinaryIntegralOperator::Operation<int64_t, string_t>(input_integer,
                                                                 heap);
   }
@@ -1576,11 +1608,11 @@ static void register_length_functions(duckdb::Catalog &catalog,
     catalog.CreateFunction(transaction, info);
   }
 
-  /* ord(VARCHAR) -> INTEGER (multibyte byte-value, replaces DuckDB codepoint) */
+  /* ord(VARCHAR) -> BIGINT (multibyte byte-value, replaces DuckDB codepoint) */
   {
     duckdb::ScalarFunctionSet set("ord");
     set.AddFunction(duckdb::ScalarFunction(
-        {duckdb::LogicalType::VARCHAR}, duckdb::LogicalType::INTEGER,
+        {duckdb::LogicalType::VARCHAR}, duckdb::LogicalType::BIGINT,
         ord_byte_func));
     duckdb::CreateScalarFunctionInfo info(std::move(set));
     info.on_conflict= duckdb::OnCreateConflict::ALTER_ON_CONFLICT;

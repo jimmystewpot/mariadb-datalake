@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 
 #include <my_global.h>
 #include <mysql/plugin.h>
@@ -2054,8 +2055,12 @@ static int show_duckdb_version(MYSQL_THD, struct st_mysql_show_var *var,
 }
 
 static struct st_mysql_show_var duckdb_status_variables[]= {
-    {"Duckdb_version", (char *) show_duckdb_version, SHOW_SIMPLE_FUNC},
-    {"Duckdb_quack", (char *) quack_status_variables, SHOW_ARRAY},
+    {"Duckdb_version",
+     reinterpret_cast<char *>(
+         reinterpret_cast<uintptr_t>(&show_duckdb_version)),
+     SHOW_SIMPLE_FUNC},
+    {"Duckdb_quack", reinterpret_cast<char *>(quack_status_variables),
+     SHOW_ARRAY},
     {"Duckdb_rows_insert", (char *) &srv_duckdb_status.duckdb_rows_insert,
      SHOW_LONGLONG},
     {"Duckdb_rows_update", (char *) &srv_duckdb_status.duckdb_rows_update,

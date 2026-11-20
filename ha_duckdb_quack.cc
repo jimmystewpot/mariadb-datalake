@@ -30,6 +30,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <thread>
 
@@ -194,8 +196,9 @@ static int show_quack_running(MYSQL_THD, struct st_mysql_show_var *var,
                               void *buff, system_status_var *, enum_var_type)
 {
   var->type= SHOW_BOOL;
-  var->value= (char *) buff;
-  *(bool *) buff= myduck::DuckdbManager::QuackStatus().running;
+  bool running= myduck::DuckdbManager::QuackStatus().running;
+  std::memcpy(buff, &running, sizeof(running));
+  var->value= static_cast<char *>(buff);
   return 0;
 }
 
@@ -206,8 +209,9 @@ static int show_quack_endpoints(MYSQL_THD, struct st_mysql_show_var *var,
   for (auto &endpoint : myduck::DuckdbManager::QuackStatus().endpoints)
     endpoints+= (endpoints.empty() ? "" : ",") + endpoint;
   var->type= SHOW_CHAR;
-  var->value= (char *) buff;
-  strmake((char *) buff, endpoints.c_str(), SHOW_VAR_FUNC_BUFF_SIZE - 1);
+  var->value= static_cast<char *>(buff);
+  strmake(static_cast<char *>(buff), endpoints.c_str(),
+          SHOW_VAR_FUNC_BUFF_SIZE - 1);
   return 0;
 }
 
@@ -216,8 +220,8 @@ static int show_quack_fingerprint(MYSQL_THD, struct st_mysql_show_var *var,
                                   enum_var_type)
 {
   var->type= SHOW_CHAR;
-  var->value= (char *) buff;
-  strmake((char *) buff,
+  var->value= static_cast<char *>(buff);
+  strmake(static_cast<char *>(buff),
           myduck::DuckdbManager::QuackStatus().fingerprint.c_str(),
           SHOW_VAR_FUNC_BUFF_SIZE - 1);
   return 0;
@@ -227,8 +231,10 @@ static int show_quack_sessions(MYSQL_THD, struct st_mysql_show_var *var,
                                void *buff, system_status_var *, enum_var_type)
 {
   var->type= SHOW_LONGLONG;
-  var->value= (char *) buff;
-  *(longlong *) buff= (longlong) myduck::DuckdbManager::QuackSessions();
+  longlong sessions=
+      static_cast<longlong>(myduck::DuckdbManager::QuackSessions());
+  std::memcpy(buff, &sessions, sizeof(sessions));
+  var->value= static_cast<char *>(buff);
   return 0;
 }
 
@@ -238,13 +244,18 @@ static int show_quack_counter(MYSQL_THD, struct st_mysql_show_var *var,
                               void *buff, system_status_var *, enum_var_type)
 {
   var->type= SHOW_LONGLONG;
-  var->value= (char *) buff;
-  *(longlong *) buff=
-      (longlong) (myduck::DuckdbManager::QuackCounters().*field);
+  longlong val=
+      static_cast<longlong>(myduck::DuckdbManager::QuackCounters().*field);
+  std::memcpy(buff, &val, sizeof(val));
+  var->value= static_cast<char *>(buff);
   return 0;
 }
 
-#define QUACK_STATUS(name, function) {name, (char *) function, SHOW_SIMPLE_FUNC}
+#define QUACK_STATUS(name, function)                                          \
+  {                                                                           \
+    name, reinterpret_cast<char *>(reinterpret_cast<uintptr_t>(+(function))), \
+        SHOW_SIMPLE_FUNC                                                      \
+  }
 #define QUACK_COUNTER(field)                                                  \
   QUACK_STATUS(#field, show_quack_counter<&quack_guard::GuardCounters::field>)
 
