@@ -80,14 +80,15 @@ static std::string LogSafe(const std::string &text)
 {
   static const size_t MAX_LENGTH= 200;
   std::string out;
-  for (unsigned char c : text)
+  for (char ch : text)
   {
+    auto c= static_cast<unsigned char>(ch);
     if (out.size() >= MAX_LENGTH)
     {
       out+= "...";
       break;
     }
-    out+= (c < 0x20 || c == 0x7f) ? '?' : (char) c;
+    out+= (c < 0x20 || c == 0x7f) ? '?' : ch;
   }
   return out;
 }

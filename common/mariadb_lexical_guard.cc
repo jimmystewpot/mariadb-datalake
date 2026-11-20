@@ -12,8 +12,9 @@ bool mariadb_query_has_lexical_mismatch(std::string_view query,
                                       bool backslash_escapes, bool ansi_quotes)
 {
   bool non_ascii= false;
-  for (unsigned char c : query)
+  for (char ch : query)
   {
+    auto c= static_cast<unsigned char>(ch);
     if (c == 0)
       return true;
     non_ascii|= c >= 0x80;
@@ -40,7 +41,7 @@ bool mariadb_query_has_lexical_mismatch(std::string_view query,
 
   for (size_t i= 0; i < query.size();)
   {
-    unsigned char c= query[i];
+    auto c= static_cast<unsigned char>(query[i]);
     if (c == '#' || c == '$' || c == '\\' || c >= 0x80 ||
         (c == '"' && !ansi_quotes))
       return true;
@@ -88,7 +89,7 @@ bool mariadb_query_has_lexical_mismatch(std::string_view query,
     {
       size_t start= i++;
       while (i < query.size() &&
-             (identifier_start(query[i]) ||
+             (identifier_start(static_cast<unsigned char>(query[i])) ||
               (query[i] >= '0' && query[i] <= '9') || query[i] == '$'))
         i++;
       if (i < query.size() && query[i] == '\'' &&

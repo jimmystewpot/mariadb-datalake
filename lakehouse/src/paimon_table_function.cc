@@ -391,7 +391,7 @@ duckdb::unique_ptr<duckdb::FunctionData> PaimonBind(
   names = duckdb::StringsToIdentifiers(bind_data->arrow_table.GetNames());
   return_types = bind_data->arrow_table.GetTypes();
   bind_data->all_types = return_types;
-  return std::move(bind_data);
+  return bind_data;
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> PaimonInitGlobal(

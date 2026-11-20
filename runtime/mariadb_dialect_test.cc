@@ -16,7 +16,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -394,6 +398,48 @@ static void test_registration(bool benchmark)
     benchmark_mariadb_parser(connection);
 }
 
+static void test_lexical_preflight_misaligned_tight_buffers()
+{
+  struct TightCase
+  {
+    std::string payload;
+    bool expected_mismatch;
+  };
+  const std::string pad(280, 'x');
+  const TightCase tight_cases[]= {
+      // 1. Valid long SQL query (> 300 bytes) with single-quoted literals,
+      //    backtick-quoted identifiers, block comments, -- comments, and UTF-8 bytes
+      {"SELECT '" + pad + " \xC3\xA9 \xF0\x9F\x98\x80 '' # -- /* */', "
+       "`col_" + pad + "_\xC3\xA9` /* block comment # " + pad + " */ "
+       "-- line comment # \xF0\x9F\x98\x80\nFROM `tbl_" + pad + "`",
+       false},
+      // 2. Invalid long SQL query (> 300 bytes) with backslash escape inside single quotes
+      {"SELECT '" + pad + "\\' OR 1=1 -- ' FROM t",
+       true},
+      // 3. Invalid long SQL query (> 300 bytes) ending with unterminated single-quoted string
+      {"SELECT `col`, '" + pad + "_unterminated_literal_without_closing_quote",
+       true},
+      // 4. Invalid long SQL query (> 300 bytes) with non-ASCII identifier and # comment outside quotes
+      {"SELECT " + pad + ", \x80_non_ascii_col FROM t # " + pad,
+       true}};
+
+  for (const auto &tc : tight_cases)
+  {
+    require(tc.payload.size() > 256, "Tight-buffer test payload must exceed 256 bytes");
+    for (size_t offset= 0; offset < 16; ++offset)
+    {
+      std::unique_ptr<char[]> tight(new char[offset + tc.payload.size()]);
+      if (offset > 0)
+        std::memset(tight.get(), 0x7F, offset);
+      std::memcpy(tight.get() + offset, tc.payload.data(), tc.payload.size());
+      std::string_view view(tight.get() + offset, tc.payload.size());
+      bool actual= myduck::mariadb_query_has_lexical_mismatch(view, true, true);
+      require(actual == tc.expected_mismatch,
+              "Tight misaligned buffer lexical preflight mismatch");
+    }
+  }
+}
+
 static void test_lexical_preflight()
 {
   struct Case
@@ -473,6 +519,7 @@ static void test_lexical_preflight()
                   std::string_view("SELECT '\0'", 10), escapes, ansi),
               "Embedded NUL was accepted");
     }
+  test_lexical_preflight_misaligned_tight_buffers();
   require(parser_entries == before, "Lexical preflight invoked the PEG parser");
 }
 

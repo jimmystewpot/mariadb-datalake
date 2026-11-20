@@ -219,7 +219,7 @@ unique_ptr<FunctionData> catalog_bind(ClientContext &context,
     return_types= schema_result.types;
     names= schema_result.names;
     data->rows= std::move(schemas.rows);
-    return std::move(data);
+    return data;
   }
 
   auto result= run(db, TABLES_QUERY);
@@ -251,7 +251,7 @@ unique_ptr<FunctionData> catalog_bind(ClientContext &context,
   for (size_t i= 0; i < candidates.size(); i++)
     if (seen.count(key_of(asked[i])))
       data->rows.push_back(std::move(candidates[i]));
-  return std::move(data);
+  return data;
 }
 
 unique_ptr<GlobalTableFunctionState> catalog_init(ClientContext &,

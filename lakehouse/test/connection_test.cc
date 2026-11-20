@@ -1,5 +1,9 @@
 // lakehouse/test/connection_test.cc
 #include <gtest/gtest.h>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <string_view>
 #include "lakehouse/lakehouse_connection.h"
 
 namespace myduck::lakehouse {
@@ -148,6 +152,45 @@ TEST(ConnectionTest, HandlesEdgeCasesEscapingAndPrefixBoundaries) {
   EXPECT_NE(quoted_ddl.find("\"sa\"\"les\".\"or\"\"ders\" (\"co\"\"l\")"),
             std::string::npos)
       << quoted_ddl;
+}
+
+TEST(ConnectionTest, TightHeapBuffersAtMisalignedOffsetsAboveSimdThreshold) {
+  SetAllowedPathPrefix("");
+  const std::string long_path =
+      "/tmp/" + std::string(280, 'a') + "/warehouse/db.db/orders";
+  const std::string valid_uri = "paimon://" + long_path;
+  const std::string invalid_uri =
+      "paimon:///tmp/" + std::string(280, 'b') + "/../secret";
+
+  for (size_t offset = 0; offset < 16; ++offset) {
+    std::unique_ptr<char[]> tight_valid(new char[offset + valid_uri.size()]);
+    if (offset > 0) {
+      std::memset(tight_valid.get(), 'X', offset);
+    }
+    std::memcpy(tight_valid.get() + offset, valid_uri.data(), valid_uri.size());
+    std::string_view valid_view(tight_valid.get() + offset, valid_uri.size());
+
+    auto cfg = ParseLakehouseUri("analytics", "orders", valid_view);
+    EXPECT_EQ(cfg.format, LakehouseFormat::kPaimonPath);
+    EXPECT_EQ(cfg.table_path, long_path);
+
+    auto comment_cfg = ParseLakehouseUri("analytics", "orders", "", valid_view);
+    EXPECT_EQ(comment_cfg.format, LakehouseFormat::kPaimonPath);
+    EXPECT_EQ(comment_cfg.table_path, long_path);
+
+    std::unique_ptr<char[]> tight_invalid(new char[offset + invalid_uri.size()]);
+    if (offset > 0) {
+      std::memset(tight_invalid.get(), 'X', offset);
+    }
+    std::memcpy(tight_invalid.get() + offset, invalid_uri.data(),
+                invalid_uri.size());
+    std::string_view invalid_view(tight_invalid.get() + offset,
+                                  invalid_uri.size());
+
+    auto bad_cfg = ParseLakehouseUri("analytics", "orders", invalid_view);
+    EXPECT_EQ(bad_cfg.format, LakehouseFormat::kInvalid);
+    EXPECT_NE(bad_cfg.error_message.find("traversal"), std::string::npos);
+  }
 }
 
 }  // namespace

@@ -270,6 +270,40 @@ TEST_F(PaimonScanTest, LargeTableMultiChunkSlicing) {
   EXPECT_EQ(chunk->GetValue(2, 0).GetValue<int32_t>(), 4999);
   EXPECT_EQ(chunk->GetValue(3, 0).GetValue<int64_t>(), (4999LL * 5000LL) / 2);
 
+  // Non-SIMD-multiple filtered slices (65 rows and 2049 = STANDARD_VECTOR_SIZE + 1 rows)
+  for (int64_t limit_id : {65LL, 2049LL}) {
+    auto slice_res = conn_->Query(
+        "SELECT COUNT(*), MIN(id), MAX(id), SUM(id) FROM paimon_scan('" + tbl_path +
+        "') WHERE id < " + std::to_string(limit_id));
+    ASSERT_FALSE(slice_res->HasError()) << slice_res->GetError();
+    auto slice_chunk = slice_res->Fetch();
+    ASSERT_NE(slice_chunk, nullptr);
+    EXPECT_EQ(slice_chunk->GetValue(0, 0).GetValue<int64_t>(), limit_id);
+    EXPECT_EQ(slice_chunk->GetValue(1, 0).GetValue<int32_t>(), 0);
+    EXPECT_EQ(slice_chunk->GetValue(2, 0).GetValue<int32_t>(),
+              static_cast<int32_t>(limit_id - 1));
+    EXPECT_EQ(slice_chunk->GetValue(3, 0).GetValue<int64_t>(),
+              ((limit_id - 1) * limit_id) / 2);
+  }
+
+  // Exact non-SIMD-multiple table row counts (65 and 2049) to exercise Arrow/Parquet batch tails
+  for (int32_t exact_rows : {65, 2049}) {
+    std::string sub_name = "unaligned_" + std::to_string(exact_rows);
+    std::string sub_path = (temp_wh / "bench.db" / sub_name).string();
+    WriteLargePaimonTable(temp_wh.string(), "bench", sub_name, exact_rows);
+    auto sub_res = conn_->Query(
+        "SELECT COUNT(*), MIN(id), MAX(id), SUM(id) FROM paimon_scan('" + sub_path + "')");
+    ASSERT_FALSE(sub_res->HasError()) << sub_res->GetError();
+    auto sub_chunk = sub_res->Fetch();
+    ASSERT_NE(sub_chunk, nullptr);
+    EXPECT_EQ(sub_chunk->GetValue(0, 0).GetValue<int64_t>(),
+              static_cast<int64_t>(exact_rows));
+    EXPECT_EQ(sub_chunk->GetValue(1, 0).GetValue<int32_t>(), 0);
+    EXPECT_EQ(sub_chunk->GetValue(2, 0).GetValue<int32_t>(), exact_rows - 1);
+    int64_t n = static_cast<int64_t>(exact_rows);
+    EXPECT_EQ(sub_chunk->GetValue(3, 0).GetValue<int64_t>(), ((n - 1) * n) / 2);
+  }
+
   std::filesystem::remove_all(temp_wh);
 }
 

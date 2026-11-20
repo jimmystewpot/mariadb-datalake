@@ -174,7 +174,7 @@ GuardedQuackServer::GuardedQuackServer(duckdb::ClientContext &context,
                                    const http::ContentReader &reader) {
         duckdb::MemoryStream body;
         bool complete= reader([&](const char *data, size_t length) {
-          body.WriteData((duckdb::data_ptr_t) data, length);
+          body.WriteData(duckdb::const_data_ptr_cast(data), length);
           return true;
         });
         if (!complete)

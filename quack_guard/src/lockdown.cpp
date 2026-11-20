@@ -29,7 +29,7 @@ static const char *const DENY_AUTH_FUNCTION= "mariadb_quack_deny_all";
 
 static const char *const DENY_QUERY_FUNCTION= "mariadb_quack_deny_query";
 
-static void deny_all(duckdb::DataChunk &args, duckdb::ExpressionState &,
+static void deny_all(duckdb::DataChunk &, duckdb::ExpressionState &,
                      duckdb::Vector &result)
 {
   result.SetVectorType(duckdb::VectorType::CONSTANT_VECTOR);
@@ -37,7 +37,7 @@ static void deny_all(duckdb::DataChunk &args, duckdb::ExpressionState &,
 }
 
 /* Quack runs the statement this returns; NULL rejects it. */
-static void deny_query(duckdb::DataChunk &args, duckdb::ExpressionState &,
+static void deny_query(duckdb::DataChunk &, duckdb::ExpressionState &,
                        duckdb::Vector &result)
 {
   result.SetVectorType(duckdb::VectorType::CONSTANT_VECTOR);
