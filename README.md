@@ -1,21 +1,65 @@
-# DuckDB Storage Engine for MariaDB
+# DuckDB Storage Engine for MariaDB (`mariadb-datalake`)
 
-A pluggable storage engine that brings [DuckDB](https://github.com/duckdb/duckdb)'s columnar analytical engine inside [MariaDB Server](https://github.com/MariaDB/server).
+A pluggable storage engine that embeds [DuckDB](https://github.com/duckdb/duckdb)'s columnar vectorized execution engine inside [MariaDB Server](https://github.com/MariaDB/server) with native C++ (zero-JVM) support for **Apache Iceberg** and **Apache Paimon** lakehouse tables.
 
-Create a table with `ENGINE=DuckDB` and analytical queries against it are executed through DuckDB's columnar vectorized engine — no ETL pipelines, no separate cluster, no additional protocols. One server, one SQL interface, the familiar `mariadb` client.
+Create a managed analytical table with `ENGINE=DuckDB` or attach an external Apache Paimon / Apache Iceberg table with `ENGINE=DuckDB CONNECTION='paimon://...'` / `CONNECTION='iceberg://...'` — analytical queries, aggregations, window functions, and cross-engine joins with InnoDB run in-process through one SQL interface and the standard `mariadb` client.
 
 ## Use Cases
 
-- **HTAP (Hybrid Transactional/Analytical Processing)** — InnoDB handles OLTP, DuckDB handles analytics, both in the same database.
-- **Ad-hoc analytical queries** — complex joins, aggregations, subqueries, and window functions over large datasets without exporting data to a separate system.
-- **Eliminating ETL complexity** — no need for a dedicated analytical cluster or data movement pipelines; the analytical engine runs in-process.
+- **HTAP (Hybrid Transactional/Analytical Processing)** — InnoDB handles OLTP, DuckDB handles analytics, both in the same MariaDB server with fiber-driven cross-engine joins.
+- **Zero-JVM Data Lakehouse Queries** — Query Apache Paimon and Apache Iceberg tables directly from MariaDB in native C++ (`paimon-cpp` + Arrow C Data Interface and DuckDB `iceberg`/`avro`/`parquet`/`httpfs`), with projection and predicate pushdown.
+- **Ad-hoc Analytical Queries** — Complex joins, aggregations, subqueries, and window functions over large datasets without ETL pipelines or a separate analytical cluster.
+
+## Native Lakehouse Tables (Apache Paimon & Apache Iceberg)
+
+External lakehouse tables are declared as read-only `ENGINE=DuckDB` tables using a `CONNECTION` URI (or `COMMENT='duckdb_connection=...'`):
+
+```sql
+-- Apache Paimon table on local or shared filesystem
+CREATE TABLE orders_paimon (
+  id BIGINT,
+  region VARCHAR(32),
+  amount DOUBLE
+) ENGINE=DuckDB CONNECTION='paimon:///var/data/warehouse/sales.db/orders';
+
+-- Apache Iceberg table via filesystem path
+CREATE TABLE events_iceberg (
+  event_id BIGINT,
+  ts DATETIME,
+  payload VARCHAR(255)
+) ENGINE=DuckDB CONNECTION='iceberg:///var/data/iceberg_warehouse/analytics/events';
+
+-- Apache Iceberg table via REST Catalog (HTTPS enforced for remote hosts)
+CREATE TABLE rest_metrics (
+  id BIGINT,
+  val DOUBLE
+) ENGINE=DuckDB CONNECTION='iceberg+rest://catalog.example.com/v1/namespaces/analytics/tables/metrics';
+```
+
+### How Lakehouse Integration Works
+
+1. **View-Backed DDL Translation (`convertor/ddl_convertor.cc`, `ha_duckdb.cc`)**:
+   - When `CREATE TABLE ... ENGINE=DuckDB CONNECTION='...'` executes, `ParseLakehouseUri()` (`lakehouse/src/connection_string.cc`) validates the URI scheme (`paimon://`, `iceberg://`, `iceberg+rest://`), rejects null bytes, control characters, relative paths, and `..` path traversal segments, and emits:
+     - `CREATE OR REPLACE VIEW "db"."table" AS SELECT * FROM paimon_scan('<escaped_path>')`
+     - `CREATE OR REPLACE VIEW "db"."table" AS SELECT * FROM iceberg_scan('<resolved_metadata_location>')`
+   - If MariaDB fails after the DuckDB view is created during `ha_duckdb::create()`, the engine issues a compensating `DROP VIEW IF EXISTS` rollback.
+   - `DROP TABLE` and `RENAME TABLE` emit `DROP VIEW IF EXISTS` and recreated view definitions for lakehouse tables.
+   - `INSERT`, `UPDATE`, `DELETE`, and `TRUNCATE` on lakehouse tables are rejected at the handler boundary with `HA_ERR_TABLE_READONLY`.
+2. **Apache Paimon C++ Reader (`lakehouse/src/paimon_table_function.cc`, `lakehouse/src/paimon_ffi_bridge.cc`)**:
+   - Registers the `paimon_scan(path)` DuckDB `TableFunction` backed by `paimon-cpp` (`third_parties/paimon-cpp`).
+   - Streams Apache Arrow record batches through a zero-copy `ArrowArrayStream` (`PaimonArrowArrayStream`) directly into DuckDB's `ArrowTableFunction::ArrowScanFunction`.
+   - Pushes column projections (`column_ids`) and DuckDB `TableFilterSet` predicates (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `IN`, `AND`, `OR`) down to `paimon::PredicateBuilder` and `paimon::ReadContextBuilder`.
+3. **Apache Iceberg & REST Catalog Resolver (`lakehouse/src/lakehouse_catalog.cc`, `duckdb_udf_wrappers.cc`)**:
+   - Statically links DuckDB's `iceberg`, `avro`, `parquet`, and `httpfs` extensions.
+   - `LakehouseCatalog::Instance()` provides a thread-safe (`std::shared_mutex`) catalog registry that resolves `iceberg+rest://` table endpoints via `libcurl` and parses `metadata-location` with `yyjson`. Remote REST catalogs require `https://` (`http://` is permitted only for `localhost` / `127.0.0.1` / `[::1]`).
+   - Provides the `SELECT duckdb_refresh_catalog('catalog_name')` UDF (`duckdb_udf_wrappers.cc`) to invalidate cached REST metadata snapshots.
 
 ## Roadmap
 
 - **Analytical GIS** — deliver geospatial analytics via DuckDB's Spatial extension.
 - **Faster HTAP over InnoDB-only data** — run queries against InnoDB-only data through DuckDB's vectorized execution.
 - **Partial query pushdown** — implement a derived handler to push parts of complex queries down into DuckDB.
-- **Data lake access** — reach data lake protocols and formats via DuckDB extensions.
+- **Write path for Lakehouse formats** — support Iceberg/Paimon append and compaction from MariaDB DML.
 
 ## Performance
 
@@ -86,11 +130,11 @@ The plugin is ABI-bound to the server it was built against: `build.sh` refuses t
 
 Remote file access (`https://`, `http://`, `s3://`) comes from DuckDB's `httpfs` extension, which is fetched at build time and linked statically. It needs the OpenSSL and libcurl development packages (`openssl-devel libcurl-devel` / `libssl-dev libcurl4-openssl-dev`, installed by `build.sh -D`); without them, or with `-DWITH_DUCKDB_HTTPFS=OFF`, the engine is built without it.
 
-### Build and install
+### Build and install (Layer B — Full MariaDB Plugin)
 
 ```bash
-git clone --recurse-submodules git@github.com:drrtuy/duckdb-engine.git
-cd duckdb-engine
+git clone --recurse-submodules https://github.com/jimmystewpot/mariadb-datalake.git
+cd mariadb-datalake
 
 # Install build dependencies (requires root)
 ./build.sh -D
@@ -136,18 +180,43 @@ Run `./build.sh -h` for the full list of options.
 ./run_mtr.sh -a -e                    # all tests against a running server
 ```
 
-### Standalone dialect tests
+### Standalone Layer A Build & Unit Tests (No MariaDB Server Required)
 
-The `mariadb_dialect_test` target is excluded from the default build (`runtime/CMakeLists.txt`). With the build prerequisites above, build and run it without installing the plugin or starting MariaDB:
+Layer A builds `libduckdb_lakehouse.a`, `libquack_guard.a`, DuckDB (with `parquet`, `avro`, `iceberg`, `httpfs`, and `quack`), `paimon-cpp`, and all 8 standalone CTest suites without requiring an installed MariaDB server or plugin SDK:
 
 ```bash
-cmake -S . -B build
-cmake --build build --target mariadb_dialect_test -j 4
-./build/runtime/mariadb_dialect_test
-./build/runtime/mariadb_dialect_test --benchmark  # warmed parser-only p50/p95/p99
+cmake -S . -B build -DSTANDALONE_TESTS=ON -DDUCKDB_WERROR=ON
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
 ```
 
-The standalone tests cover lexical preflight, single-parse AST handoff, and paired grammar/AST/result checks. Integration regressions include `duckdb_lexical_guard` and `duckdb_peg_pushdown`. Local RelWithDebInfo verification on 2026-11-10 passed all 57 enabled MTR runs (including replication combinations), with one debug-only skip and 24 disabled tests. This working-tree result includes separately updated DuckDB-pin expected results; it is not full security or release-readiness evidence. Release performance work remains: concurrency, end-to-end p95/p99 latency, and a production query corpus. Parser-only timings do not measure those workloads or the old text-rewrite cost.
+The 8 Layer A test suites are:
+- `quack_guard_test` — Quack server pre-bind/post-bind gates, catalog filtering, and TLS session security.
+- `mariadb_dialect_test` — MariaDB lexical preflight (including tight ASan heap buffers at misaligned offsets `0..15`), PEG dialect grammar, and single-parse AST handoff (`--benchmark` for warmed parser p50/p95/p99).
+- `fiber_context_test` — Cooperative fiber stack switching (`x86_64`, `i386`, `aarch64` inline assembly and `ucontext`), active-state tracking, and 16-byte stack frame alignment across misaligned stack sizes.
+- `smoke_test` — Static extension loader verification for `iceberg`, `parquet`, `avro`, and `paimon-cpp` symbols.
+- `connection_test` — `paimon://`, `iceberg://`, and `iceberg+rest://` URI parsing, path-traversal/null-byte rejection, and tight-buffer misaligned-offset tests.
+- `paimon_scan_test` — `paimon_scan()` Arrow C Data Interface bridge, projection pushdown, filter pushdown, multi-chunk slicing (`65`, `2049`, `5000` rows), and corrupted-table error propagation.
+- `iceberg_catalog_test` — `LakehouseCatalog` thread-safe registry, mock REST catalog HTTP resolution, `iceberg_scan()` Parquet reading, and HTTPS enforcement for remote hosts.
+- `lakehouse_e2e_test` — End-to-end view-based DDL lifecycle (`CREATE OR REPLACE VIEW`, `DROP VIEW IF EXISTS`), Paimon + Iceberg + native DuckDB cross-format joins, aggregations, and read-only enforcement.
+
+### Sanitizer & Strict Warning Verification (ASan + UBSan)
+
+All targets configured via `duckdb_setup_target` (`cmake/duckdb_target_setup.cmake`) compile under `-Wall -Wextra -Wcast-qual -Wcast-align(=strict) -Wconversion -Wsign-conversion -pedantic -Wshadow -Werror` and support `-DWITH_ASAN=ON` and `-DWITH_UBSAN=ON` across GCC and Clang:
+
+```bash
+# ASan + UBSan (instruments libraries and test binaries)
+cmake -S . -B build-asan -DSTANDALONE_TESTS=ON -DDUCKDB_WERROR=ON -DWITH_ASAN=ON -DWITH_UBSAN=ON
+cmake --build build-asan -j$(nproc)
+ctest --test-dir build-asan --output-on-failure
+
+# Standalone UBSan (exercises native x86_64/ARM64 fiber assembly without ASan ucontext fallback)
+cmake -S . -B build-ubsan -DSTANDALONE_TESTS=ON -DDUCKDB_WERROR=ON -DWITH_ASAN=OFF -DWITH_UBSAN=ON
+cmake --build build-ubsan -j$(nproc)
+ctest --test-dir build-ubsan --output-on-failure
+```
+
+Alternate build directories (`build-asan`, `build-ubsan`, etc.) automatically reuse prebuilt `build/duckdb-build` and `build/paimon-build` artifacts when `build/` has already been built.
 
 ## Cross-Engine Queries
 
