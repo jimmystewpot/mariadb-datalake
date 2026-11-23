@@ -31,13 +31,15 @@ TARGET_LINK_LIBRARIES(duckdb_lakehouse PUBLIC
 IF(DUCKDB_UNIT_TESTS)
   FIND_PACKAGE(GTest QUIET)
   IF(NOT GTest_FOUND)
+    IF(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_parties/googletest/CMakeLists.txt")
+      MESSAGE(FATAL_ERROR "googletest submodule is missing: run 'git submodule update --init third_parties/googletest'")
+    ENDIF()
     INCLUDE(FetchContent)
     SET(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     SET(BUILD_GMOCK ON CACHE BOOL "" FORCE)
     FetchContent_Declare(
       googletest
-      URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz
-      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+      SOURCE_DIR "${PROJECT_SOURCE_DIR}/third_parties/googletest"
     )
     FetchContent_MakeAvailable(googletest)
     IF(TARGET gtest)
@@ -71,6 +73,8 @@ IF(DUCKDB_UNIT_TESTS)
       PAIMON_GOLDEN_DATA_DIR="${PAIMON_SUBMODULE_DIR}/test/test_data"
       LAKEHOUSE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures"
       QUACK_TEST_CERT_DIR="${PROJECT_SOURCE_DIR}/third_parties/duckdb-quack/test/certs"
+      LAKEHOUSE_REPO_ROOT="${PROJECT_SOURCE_DIR}"
+      LAKEHOUSE_DEPS_PREFIX="${_DUCKDB_DEPS_PREFIX}"
     )
     TARGET_LINK_LIBRARIES(${_target_name} PRIVATE
       duckdb_lakehouse

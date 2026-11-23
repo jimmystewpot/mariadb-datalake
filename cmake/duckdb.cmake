@@ -78,39 +78,39 @@ OPTION(WITH_DUCKDB_ICEBERG "Link DuckDB's avro and iceberg extensions" ON)
 IF(WITH_DUCKDB_ICEBERG)
   LIST(APPEND _DUCKDB_LINKED_EXTENSIONS avro iceberg)
 
-  # 1. Build and install static CRoaring v4.2.1 for duckdb-iceberg
+  # 1. Build and install static CRoaring from third_parties/CRoaring for duckdb-iceberg
   FILE(MAKE_DIRECTORY
     "${_DUCKDB_DEPS_PREFIX}/include"
     "${_DUCKDB_DEPS_PREFIX}/lib"
     "${_DUCKDB_DEPS_PREFIX}/lib/cmake/roaring"
     "${_DUCKDB_DEPS_PREFIX}/lib/cmake/jansson")
-  IF(NOT EXISTS "${_DUCKDB_DEPS_PREFIX}/include/roaring/roaring64.h")
-    MESSAGE(STATUS "Building static CRoaring v4.2.1 (libroaring.a) for duckdb-iceberg...")
-    SET(_ROARING_TARBALL "${CMAKE_CURRENT_BINARY_DIR}/CRoaring-4.2.1.tar.gz")
-    SET(_ROARING_SRC_DIR "${CMAKE_CURRENT_BINARY_DIR}/CRoaring-4.2.1")
-    SET(_ROARING_BLD_DIR "${CMAKE_CURRENT_BINARY_DIR}/CRoaring-4.2.1-build")
-    IF(NOT EXISTS "${_ROARING_TARBALL}")
-      FILE(DOWNLOAD
-        "https://github.com/RoaringBitmap/CRoaring/archive/refs/tags/v4.2.1.tar.gz"
-        "${_ROARING_TARBALL}"
-        STATUS _roaring_dl_status)
-      LIST(GET _roaring_dl_status 0 _roaring_dl_code)
-      IF(NOT _roaring_dl_code EQUAL 0)
-        MESSAGE(FATAL_ERROR "Failed to download CRoaring-4.2.1.tar.gz: ${_roaring_dl_status}")
-      ENDIF()
-    ENDIF()
-    FILE(REMOVE_RECURSE "${_ROARING_SRC_DIR}" "${_ROARING_BLD_DIR}")
+  SET(_ROARING_SUBMODULE_DIR "${_MAIN_REPO_ROOT}/third_parties/CRoaring")
+  IF(NOT EXISTS "${_ROARING_SUBMODULE_DIR}/CMakeLists.txt")
+    MESSAGE(FATAL_ERROR "CRoaring submodule is missing: run 'git submodule update --init third_parties/CRoaring'")
+  ENDIF()
+  EXECUTE_PROCESS(
+    COMMAND git rev-parse HEAD
+    WORKING_DIRECTORY "${_ROARING_SUBMODULE_DIR}"
+    OUTPUT_VARIABLE _ROARING_HEAD OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _roaring_git_rc ERROR_QUIET)
+  IF(NOT _roaring_git_rc EQUAL 0 OR "${_ROARING_HEAD}" STREQUAL "")
+    SET(_ROARING_HEAD "unknown")
+  ENDIF()
+  SET(_ROARING_STAMP_FILE "${_DUCKDB_DEPS_PREFIX}/.roaring_commit")
+  SET(_ROARING_STAMP "")
+  IF(EXISTS "${_ROARING_STAMP_FILE}")
+    FILE(READ "${_ROARING_STAMP_FILE}" _ROARING_STAMP)
+    STRING(STRIP "${_ROARING_STAMP}" _ROARING_STAMP)
+  ENDIF()
+  IF(NOT EXISTS "${_DUCKDB_DEPS_PREFIX}/include/roaring/roaring64.h" OR
+     NOT "${_ROARING_HEAD}" STREQUAL "${_ROARING_STAMP}")
+    MESSAGE(STATUS "Building static CRoaring (${_ROARING_HEAD}) for duckdb-iceberg...")
+    SET(_ROARING_BLD_DIR "${CMAKE_CURRENT_BINARY_DIR}/CRoaring-build")
+    FILE(REMOVE_RECURSE "${_ROARING_BLD_DIR}")
     FILE(MAKE_DIRECTORY "${_ROARING_BLD_DIR}")
     EXECUTE_PROCESS(
-      COMMAND ${CMAKE_COMMAND} -E tar xzf "${_ROARING_TARBALL}"
-      WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-      RESULT_VARIABLE _roaring_tar_rc)
-    IF(NOT _roaring_tar_rc EQUAL 0)
-      MESSAGE(FATAL_ERROR "Failed to extract CRoaring-4.2.1.tar.gz")
-    ENDIF()
-    EXECUTE_PROCESS(
       COMMAND ${CMAKE_COMMAND} -E env CMAKE_POLICY_VERSION_MINIMUM=3.5
-              ${CMAKE_COMMAND} -S "${_ROARING_SRC_DIR}" -B "${_ROARING_BLD_DIR}"
+              ${CMAKE_COMMAND} -S "${_ROARING_SUBMODULE_DIR}" -B "${_ROARING_BLD_DIR}"
               -DCMAKE_BUILD_TYPE=Release
               -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
               -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
@@ -125,44 +125,45 @@ IF(WITH_DUCKDB_ICEBERG)
               -DROARING_USE_CPM=OFF
       RESULT_VARIABLE _roaring_cfg_rc)
     IF(NOT _roaring_cfg_rc EQUAL 0)
-      MESSAGE(FATAL_ERROR "Failed to configure CRoaring-4.2.1")
+      MESSAGE(FATAL_ERROR "Failed to configure CRoaring from ${_ROARING_SUBMODULE_DIR}")
     ENDIF()
     EXECUTE_PROCESS(
       COMMAND ${CMAKE_COMMAND} --build "${_ROARING_BLD_DIR}" --target install -j4
       RESULT_VARIABLE _roaring_bld_rc)
     IF(NOT _roaring_bld_rc EQUAL 0)
-      MESSAGE(FATAL_ERROR "Failed to build/install CRoaring-4.2.1")
+      MESSAGE(FATAL_ERROR "Failed to build/install CRoaring from ${_ROARING_SUBMODULE_DIR}")
     ENDIF()
+    FILE(WRITE "${_ROARING_STAMP_FILE}" "${_ROARING_HEAD}\n")
   ENDIF()
 
-  # 2. Build and install static libjansson.a for duckdb-avro (avro-c)
-  IF(NOT EXISTS "${_DUCKDB_DEPS_PREFIX}/lib/libjansson.a")
-    MESSAGE(STATUS "Building static libjansson.a for duckdb-avro...")
-    SET(_JANSSON_TARBALL "${CMAKE_CURRENT_BINARY_DIR}/jansson-2.14.tar.gz")
-    SET(_JANSSON_SRC_DIR "${CMAKE_CURRENT_BINARY_DIR}/jansson-2.14")
-    SET(_JANSSON_BLD_DIR "${CMAKE_CURRENT_BINARY_DIR}/jansson-2.14-build")
-    IF(NOT EXISTS "${_JANSSON_TARBALL}")
-      FILE(DOWNLOAD
-        "https://github.com/akheron/jansson/releases/download/v2.14/jansson-2.14.tar.gz"
-        "${_JANSSON_TARBALL}"
-        STATUS _dl_status)
-      LIST(GET _dl_status 0 _dl_code)
-      IF(NOT _dl_code EQUAL 0)
-        MESSAGE(FATAL_ERROR "Failed to download jansson-2.14.tar.gz: ${_dl_status}")
-      ENDIF()
-    ENDIF()
-    FILE(REMOVE_RECURSE "${_JANSSON_SRC_DIR}" "${_JANSSON_BLD_DIR}")
+  # 2. Build and install static libjansson.a from third_parties/jansson for duckdb-avro (avro-c)
+  SET(_JANSSON_SUBMODULE_DIR "${_MAIN_REPO_ROOT}/third_parties/jansson")
+  IF(NOT EXISTS "${_JANSSON_SUBMODULE_DIR}/CMakeLists.txt")
+    MESSAGE(FATAL_ERROR "jansson submodule is missing: run 'git submodule update --init third_parties/jansson'")
+  ENDIF()
+  EXECUTE_PROCESS(
+    COMMAND git rev-parse HEAD
+    WORKING_DIRECTORY "${_JANSSON_SUBMODULE_DIR}"
+    OUTPUT_VARIABLE _JANSSON_HEAD OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _jansson_git_rc ERROR_QUIET)
+  IF(NOT _jansson_git_rc EQUAL 0 OR "${_JANSSON_HEAD}" STREQUAL "")
+    SET(_JANSSON_HEAD "unknown")
+  ENDIF()
+  SET(_JANSSON_STAMP_FILE "${_DUCKDB_DEPS_PREFIX}/.jansson_commit")
+  SET(_JANSSON_STAMP "")
+  IF(EXISTS "${_JANSSON_STAMP_FILE}")
+    FILE(READ "${_JANSSON_STAMP_FILE}" _JANSSON_STAMP)
+    STRING(STRIP "${_JANSSON_STAMP}" _JANSSON_STAMP)
+  ENDIF()
+  IF(NOT EXISTS "${_DUCKDB_DEPS_PREFIX}/lib/libjansson.a" OR
+     NOT "${_JANSSON_HEAD}" STREQUAL "${_JANSSON_STAMP}")
+    MESSAGE(STATUS "Building static libjansson.a (${_JANSSON_HEAD}) for duckdb-avro...")
+    SET(_JANSSON_BLD_DIR "${CMAKE_CURRENT_BINARY_DIR}/jansson-build")
+    FILE(REMOVE_RECURSE "${_JANSSON_BLD_DIR}")
     FILE(MAKE_DIRECTORY "${_JANSSON_BLD_DIR}")
     EXECUTE_PROCESS(
-      COMMAND ${CMAKE_COMMAND} -E tar xzf "${_JANSSON_TARBALL}"
-      WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-      RESULT_VARIABLE _jansson_tar_rc)
-    IF(NOT _jansson_tar_rc EQUAL 0)
-      MESSAGE(FATAL_ERROR "Failed to extract jansson-2.14.tar.gz")
-    ENDIF()
-    EXECUTE_PROCESS(
       COMMAND ${CMAKE_COMMAND} -E env CMAKE_POLICY_VERSION_MINIMUM=3.5
-              ${CMAKE_COMMAND} -S "${_JANSSON_SRC_DIR}" -B "${_JANSSON_BLD_DIR}"
+              ${CMAKE_COMMAND} -S "${_JANSSON_SUBMODULE_DIR}" -B "${_JANSSON_BLD_DIR}"
               -DCMAKE_BUILD_TYPE=Release
               -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
               -DCMAKE_POSITION_INDEPENDENT_CODE=ON
@@ -176,14 +177,15 @@ IF(WITH_DUCKDB_ICEBERG)
               -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       RESULT_VARIABLE _jansson_cfg_rc)
     IF(NOT _jansson_cfg_rc EQUAL 0)
-      MESSAGE(FATAL_ERROR "Failed to configure jansson-2.14")
+      MESSAGE(FATAL_ERROR "Failed to configure jansson from ${_JANSSON_SUBMODULE_DIR}")
     ENDIF()
     EXECUTE_PROCESS(
       COMMAND ${CMAKE_COMMAND} --build "${_JANSSON_BLD_DIR}" --target install -j4
       RESULT_VARIABLE _jansson_bld_rc)
     IF(NOT _jansson_bld_rc EQUAL 0)
-      MESSAGE(FATAL_ERROR "Failed to build/install jansson-2.14")
+      MESSAGE(FATAL_ERROR "Failed to build/install jansson from ${_JANSSON_SUBMODULE_DIR}")
     ENDIF()
+    FILE(WRITE "${_JANSSON_STAMP_FILE}" "${_JANSSON_HEAD}\n")
   ENDIF()
   FILE(WRITE "${_DUCKDB_DEPS_PREFIX}/lib/cmake/jansson/janssonConfig.cmake"
 "if(NOT TARGET jansson::jansson)

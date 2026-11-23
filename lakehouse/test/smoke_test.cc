@@ -1,6 +1,8 @@
 // lakehouse/test/smoke_test.cc
 #include <gtest/gtest.h>
 #include <filesystem>
+#include <fstream>
+#include <string>
 #include "duckdb.hpp"
 #include "paimon/catalog/catalog.h"
 #include "paimon/catalog/identifier.h"
@@ -11,6 +13,30 @@
 #include "paimon/table/source/table_scan.h"
 
 extern "C" int32_t duckdb_register_static_extensions(void);
+
+TEST(LakehouseFoundationSmoke, SubmoduleDepsAndCommitStampsPresent) {
+  const std::filesystem::path repo_root(LAKEHOUSE_REPO_ROOT);
+  const std::filesystem::path deps_prefix(LAKEHOUSE_DEPS_PREFIX);
+
+  EXPECT_TRUE(std::filesystem::exists(repo_root / "third_parties/CRoaring/CMakeLists.txt"));
+  EXPECT_TRUE(std::filesystem::exists(repo_root / "third_parties/jansson/CMakeLists.txt"));
+  EXPECT_TRUE(std::filesystem::exists(repo_root / "third_parties/googletest/CMakeLists.txt"));
+
+  const auto roaring_stamp_path = deps_prefix / ".roaring_commit";
+  const auto jansson_stamp_path = deps_prefix / ".jansson_commit";
+  ASSERT_TRUE(std::filesystem::exists(roaring_stamp_path));
+  ASSERT_TRUE(std::filesystem::exists(jansson_stamp_path));
+
+  std::ifstream roaring_in(roaring_stamp_path);
+  std::string roaring_sha;
+  std::getline(roaring_in, roaring_sha);
+  EXPECT_EQ(roaring_sha.size(), 40U);
+
+  std::ifstream jansson_in(jansson_stamp_path);
+  std::string jansson_sha;
+  std::getline(jansson_in, jansson_sha);
+  EXPECT_EQ(jansson_sha.size(), 40U);
+}
 
 TEST(FoundationSmokeTest, StaticExtensionsIcebergAvroAndPaimonCppLinkAndExecute) {
   ASSERT_EQ(duckdb_register_static_extensions(), 0);
