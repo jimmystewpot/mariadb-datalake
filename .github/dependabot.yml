@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      # third_parties/duckdb and third_parties/duckdb-quack are lockstep-coupled
+      # by cmake/duckdb.cmake (quack.cmake SHA check, patches/duckdb-quack/*,
+      # and cmake/duckdb_extensions.cmake) and must be upgraded together manually.
+      - dependency-name: "third_parties/duckdb"
+      - dependency-name: "third_parties/duckdb-quack"

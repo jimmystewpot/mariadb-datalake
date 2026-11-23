@@ -10,11 +10,11 @@ The build system (`CMakeLists.txt`) supports two modes:
 
 ### Layer A — Standalone Mode (No MariaDB SDK Required)
 Enabled via `-DSTANDALONE_TESTS=ON` (or automatically when `MYSQL_SOURCE_DIR` is not defined and `find_package(mariadb-plugin)` is skipped). Builds:
-- `libduckdb_bundle.a` (`cmake/duckdb.cmake` — DuckDB `third_parties/duckdb` + `parquet`, `avro`, `iceberg`, `httpfs`, `quack`)
+- `libduckdb_bundle.a` (`cmake/duckdb.cmake` — DuckDB `third_parties/duckdb` + `parquet`, `avro`, `iceberg`, `httpfs`, `quack` from `third_parties/duckdb-quack`, plus `third_parties/CRoaring` and `third_parties/jansson` staged into `build/duckdb-deps-install` with `.roaring_commit` and `.jansson_commit` stamp tracking)
 - `libpaimon.a` (`cmake/paimon.cmake` — `third_parties/paimon-cpp` + bundled Arrow)
 - `libduckdb_lakehouse.a` (`lakehouse/CMakeLists.txt`)
 - `libquack_guard.a` (`quack_guard/CMakeLists.txt`)
-- 8 standalone CTest executables: `quack_guard_test`, `mariadb_dialect_test`, `fiber_context_test`, `smoke_test`, `connection_test`, `paimon_scan_test`, `iceberg_catalog_test`, `lakehouse_e2e_test`
+- 8 standalone CTest executables (linked against `third_parties/googletest`): `quack_guard_test`, `mariadb_dialect_test`, `fiber_context_test`, `smoke_test`, `connection_test`, `paimon_scan_test`, `iceberg_catalog_test`, `lakehouse_e2e_test`
 
 ```bash
 # Configure, build, and run all 8 Layer A test suites
@@ -84,3 +84,4 @@ When modifying C++ code, preserve these invariants:
   ```
 - Never commit or force-add (`git add -f`) any files under `docs/superpowers/` or `.superpowers/`.
 - Run `ctest --test-dir build --output-on-failure` and verify a clean working tree (`git status`) before pushing.
+- **Submodules & Dependabot (`.github/dependabot.yml`):** All third-party dependencies are tracked as git submodules under `third_parties/`: `third_parties/duckdb`, `third_parties/duckdb-quack`, `third_parties/paimon-cpp`, `third_parties/CRoaring`, `third_parties/jansson`, and `third_parties/googletest`. `cmake/duckdb.cmake` records `third_parties/CRoaring` and `third_parties/jansson` HEAD SHAs in `build/duckdb-deps-install/.roaring_commit` and `build/duckdb-deps-install/.jansson_commit` so prebuilt caches invalidate automatically on submodule bumps. `.github/dependabot.yml` checks `github-actions` and independent `gitsubmodule` dependencies weekly while ignoring the lockstep-coupled `third_parties/duckdb` and `third_parties/duckdb-quack` pair (which must be upgraded together manually).

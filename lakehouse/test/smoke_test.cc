@@ -38,6 +38,24 @@ TEST(LakehouseFoundationSmoke, SubmoduleDepsAndCommitStampsPresent) {
   EXPECT_EQ(jansson_sha.size(), 40U);
 }
 
+TEST(LakehouseFoundationSmoke, DependabotConfigProtectsLockstepSubmodules) {
+  const std::filesystem::path repo_root(LAKEHOUSE_REPO_ROOT);
+  const auto dependabot_path = repo_root / ".github/dependabot.yml";
+  ASSERT_TRUE(std::filesystem::exists(dependabot_path));
+
+  std::ifstream in(dependabot_path);
+  std::string content((std::istreambuf_iterator<char>(in)),
+                      std::istreambuf_iterator<char>());
+  EXPECT_NE(content.find("package-ecosystem: \"github-actions\""),
+            std::string::npos);
+  EXPECT_NE(content.find("package-ecosystem: \"gitsubmodule\""),
+            std::string::npos);
+  EXPECT_NE(content.find("dependency-name: \"third_parties/duckdb\""),
+            std::string::npos);
+  EXPECT_NE(content.find("dependency-name: \"third_parties/duckdb-quack\""),
+            std::string::npos);
+}
+
 TEST(FoundationSmokeTest, StaticExtensionsIcebergAvroAndPaimonCppLinkAndExecute) {
   ASSERT_EQ(duckdb_register_static_extensions(), 0);
   duckdb::DuckDB db(nullptr);
