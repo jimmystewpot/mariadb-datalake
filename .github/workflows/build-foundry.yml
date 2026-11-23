@@ -42,7 +42,7 @@ jobs:
           - { name: ubsan-only, flags: "-DWITH_ASAN=OFF -DWITH_UBSAN=ON" }
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
